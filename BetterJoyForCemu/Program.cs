@@ -228,13 +228,13 @@ namespace BetterJoyForCemu {
                                 v.Invoke(new MethodInvoker(delegate {
                                     v.Tag = j.Last(); // assign controller to button
                                     v.Enabled = true;
-                                    v.Click += new EventHandler(form.conBtnClick);
+                                    v.MouseDown += new MouseEventHandler(form.conBtnClick);
                                     v.BackgroundImage = temp;
                                 }));
 
                                 form.loc[ii].Invoke(new MethodInvoker(delegate {
                                     form.loc[ii].Tag = v;
-                                    form.loc[ii].Click += new EventHandler(form.locBtnClickAsync);
+                                    form.loc[ii].MouseDown += new MouseEventHandler(form.locBtnClickAsync);
                                 }));
 
                                 break;
@@ -255,51 +255,7 @@ namespace BetterJoyForCemu {
                 ptr = enumerate.next;
             }
 
-            if (foundNew) { // attempt to auto join-up joycons on connection
-                Joycon temp = null;
-                foreach (Joycon v in j) {
-                    // Do not attach two controllers if they are either:
-                    // - Not a Joycon
-                    // - Already attached to another Joycon (that isn't itself)
-                    if (v.isPro || (v.other != null && v.other != v)) {
-                        continue;
-                    }
-
-                    // Otherwise, iterate through and find the Joycon with the lowest
-                    // id that has not been attached already (Does not include self)
-                    if (temp == null)
-                        temp = v;
-                    else if (temp.isLeft != v.isLeft && v.other == null) {
-                        temp.other = v;
-                        v.other = temp;
-
-                        if (temp.out_xbox != null) {
-                            try {
-                                temp.out_xbox.Disconnect();
-                            } catch (Exception e) {
-                                // it wasn't connected in the first place, go figure
-                            }
-                        }
-                        if (temp.out_ds4 != null) {
-                            try {
-                                temp.out_ds4.Disconnect();
-                            } catch (Exception e) {
-                                // it wasn't connected in the first place, go figure
-                            }
-                        }
-                        temp.out_xbox = null;
-                        temp.out_ds4 = null;
-
-                        foreach (Button b in form.con)
-                            if (b.Tag == v || b.Tag == temp) {
-                                Joycon tt = (b.Tag == v) ? v : (b.Tag == temp) ? temp : v;
-                                b.BackgroundImage = tt.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
-                            }
-
-                        temp = null;    // repeat
-                    }
-                }
-            }
+            // Auto-join and forced decouple logic removed to allow 100% manual control via Right-Click.
 
             HIDapi.hid_free_enumeration(top_ptr);
 

@@ -14,9 +14,13 @@ using Nefarius.ViGEm.Client.Targets.Xbox360;
 namespace BetterJoyForCemu {
     public class Joycon {
         public string path = String.Empty;
+        // Variable para almacenar el color (Por defecto gris oscuro si falla la lectura)
+        public System.Drawing.Color BodyColor = System.Drawing.Color.FromArgb(255, 82, 82, 82);
         public bool isPro = false;
         public bool isSnes = false;
         public bool is64 = false;
+        public bool isVerticalMode = false;
+        public bool forceGyroVertical = false;
         bool isUSB = false;
         private Joycon _other = null;
 
@@ -41,6 +45,16 @@ namespace BetterJoyForCemu {
                     // Set LED to current Joycon Pair
                     int lowestPadId = Math.Min(_other.PadId, PadId);
                     SetLEDByPlayerNum(lowestPadId);
+                }
+
+                // Refresh settings when orientation changes
+                this.swapAB = Boolean.Parse(ConfigurationManager.AppSettings["SwapAB"]);
+                this.swapXY = Boolean.Parse(ConfigurationManager.AppSettings["SwapXY"]);
+
+                if (form != null) {
+                    form.Invoke(new MethodInvoker(delegate {
+                        BatteryChanged();
+                    }));
                 }
             }
         }
@@ -72,6 +86,7 @@ namespace BetterJoyForCemu {
         };
         public state_ state;
         public enum Button : int {
+            NONE = -1,
             DPAD_DOWN = 0,
             DPAD_RIGHT = 1,
             DPAD_LEFT = 2,
@@ -325,6 +340,15 @@ namespace BetterJoyForCemu {
                 if (toRumble)
                     out_ds4.FeedbackReceived += Ds4_FeedbackReceived;
             }
+
+            // Initialize orientation mode from Mappings or global config
+            string orientationKey = "Gyro_Orientation_" + (isLeft ? "Left" : "Right");
+            string orientationSetting = Mappings.GetString(orientationKey);
+            if (orientationSetting != null) {
+                isVerticalMode = (orientationSetting.ToLower() == "vertical");
+            } else {
+                isVerticalMode = false; // Default to horizontal to match UI
+            }
         }
 
         public void getActiveData() {
@@ -486,24 +510,24 @@ namespace BetterJoyForCemu {
         }
 
         private void BatteryChanged() { // battery changed level
+            System.Drawing.Color colorToUse = this.BodyColor;
+            if (other != null && other != this) {
+                // Usar el color del "maestro" (el que tiene el PadId menor) del grupo
+                if (other.PadId < this.PadId) {
+                    colorToUse = other.BodyColor;
+                }
+            }
+
             foreach (var v in form.con) {
                 if (v.Tag == this) {
-                    switch (battery) {
-                        case 4:
-                            v.BackColor = System.Drawing.Color.FromArgb(0xAA, System.Drawing.Color.Green);
-                            break;
-                        case 3:
-                            v.BackColor = System.Drawing.Color.FromArgb(0xAA, System.Drawing.Color.Green);
-                            break;
-                        case 2:
-                            v.BackColor = System.Drawing.Color.FromArgb(0xAA, System.Drawing.Color.GreenYellow);
-                            break;
-                        case 1:
-                            v.BackColor = System.Drawing.Color.FromArgb(0xAA, System.Drawing.Color.Orange);
-                            break;
-                        default:
-                            v.BackColor = System.Drawing.Color.FromArgb(0xAA, System.Drawing.Color.Red);
-                            break;
+                    // Si la batería es crítica, mantenemos el rojo para avisar al usuario
+                    // El valor -1 indica que aún no se ha leído la batería, por lo que usamos el color del cuerpo
+                    if (battery != -1 && battery <= 0) {
+                        v.BackColor = System.Drawing.Color.FromArgb(0xAA, System.Drawing.Color.Red);
+                    } else {
+                        // Usamos el color determinado (el propio o el del maestro si están unidos)
+                        // Usamos 0xAA (170) en Alpha para mantener la transparencia original del diseño
+                        v.BackColor = System.Drawing.Color.FromArgb(0xAA, colorToUse);
                     }
                 }
             }
@@ -583,7 +607,7 @@ namespace BetterJoyForCemu {
                     if (out_ds4 != null) {
                         try {
                             out_ds4.UpdateInput(MapToDualShock4Input(this));
-                        } catch (Exception e) {
+                        } catch (Exception) {
                             // ignore /shrug
                         }
                     }
@@ -593,7 +617,7 @@ namespace BetterJoyForCemu {
                 if (out_xbox != null) {
                     try {
                         out_xbox.UpdateInput(MapToXbox360Input(this));
-                    } catch (Exception e) {
+                    } catch (Exception) {
                         // ignore /shrug
                     }
                 }
@@ -705,6 +729,10 @@ namespace BetterJoyForCemu {
         bool GyroHoldToggle = Boolean.Parse(ConfigurationManager.AppSettings["GyroHoldToggle"]);
         bool GyroAnalogSliders = Boolean.Parse(ConfigurationManager.AppSettings["GyroAnalogSliders"]);
         int GyroAnalogSensitivity = Int32.Parse(ConfigurationManager.AppSettings["GyroAnalogSensitivity"]);
+        static bool SingleJoyConGyroVertical = Boolean.Parse(ConfigurationManager.AppSettings["SingleJoyConGyroVertical"]);
+        static bool LeftJoyConForceABXY = Boolean.Parse(ConfigurationManager.AppSettings["LeftJoyConForceABXY"]);
+
+
         byte[] sliderVal = new byte[] { 0, 0 };
 
         private void DoThingsWithButtons() {
@@ -723,7 +751,7 @@ namespace BetterJoyForCemu {
 
             if (ChangeOrientationDoubleClick && buttons_down[(int)Button.STICK] && lastDoubleClick != -1 && !isPro) {
                 if ((buttons_down_timestamp[(int)Button.STICK] - lastDoubleClick) < 3000000) {
-                    form.conBtnClick(form.con[PadId], EventArgs.Empty); // trigger connection button click
+                    form.conBtnClick(form.con[PadId], new MouseEventArgs(MouseButtons.Left, 1, 0, 0, 0)); // trigger connection button click
 
                     lastDoubleClick = buttons_down_timestamp[(int)Button.STICK];
                     return;
@@ -813,21 +841,24 @@ namespace BetterJoyForCemu {
             if (res_val.StartsWith("joy_")) {
                 int i = Int32.Parse(res_val.Substring(4));
                 if (GyroHoldToggle) {
-                    if (buttons_down[i] || (other != null && other.buttons_down[i]))
+                    if (buttons_down[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_down[i]))
                         active_gyro = true;
-                    else if (buttons_up[i] || (other != null && other.buttons_up[i]))
+                    else if (buttons_up[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_up[i]))
                         active_gyro = false;
                 } else {
-                    if (buttons_down[i] || (other != null && other.buttons_down[i]))
+                    if (buttons_down[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_down[i]))
                         active_gyro = !active_gyro;
                 }
             }
 
             if (extraGyroFeature.Substring(0, 3) == "joy") {
-                if (Config.Value("active_gyro") == "0" || active_gyro) {
-                    float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
+                // Definimos cuál stick vamos a controlar (izquierdo o derecho)
+                float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
 
+                if (Config.Value("active_gyro") == "0" || active_gyro) {
+                    
                     float dx, dy;
+
                     if (UseFilteredIMU) {
                         dx = (GyroStickSensitivityX * (cur_rotation[1] - cur_rotation[4])); // yaw
                         dy = -(GyroStickSensitivityY * (cur_rotation[0] - cur_rotation[3])); // pitch
@@ -836,8 +867,18 @@ namespace BetterJoyForCemu {
                         dy = -(GyroStickSensitivityY * (gyr_g.Y * dt)); // pitch
                     }
 
+                    // Apply Custom Config Sensitivity/Direction Multipliers
+                    dx *= Mappings.GetFloat("Gyro_Sensitivity_X");
+                    dy *= Mappings.GetFloat("Gyro_Sensitivity_Y");
+
                     control_stick[0] = Math.Max(-1.0f, Math.Min(1.0f, control_stick[0] / GyroStickReduction + dx));
                     control_stick[1] = Math.Max(-1.0f, Math.Min(1.0f, control_stick[1] / GyroStickReduction + dy));
+                } else {
+                    // MODIFICACIÓN:
+                    // Si el giroscopio NO está activo (y no está configurado como siempre activo "0"),
+                    // forzamos el stick a 0,0 (centro).
+                    control_stick[0] = 0.0f;
+                    control_stick[1] = 0.0f;
                 }
             } else if (extraGyroFeature == "mouse" && (isPro || (other == null) || (other != null && (Boolean.Parse(ConfigurationManager.AppSettings["GyroMouseLeftHanded"]) ? isLeft : !isLeft)))) {
                 // gyro data is in degrees/s
@@ -851,6 +892,10 @@ namespace BetterJoyForCemu {
                         dx = (int)(GyroMouseSensitivityX * (gyr_g.Z * dt));
                         dy = (int)-(GyroMouseSensitivityY * (gyr_g.Y * dt));
                     }
+                    
+                    // Apply Custom Config Sensitivity/Direction Multipliers
+                    dx = (int)(dx * Mappings.GetFloat("Gyro_Sensitivity_X"));
+                    dy = (int)(dy * Mappings.GetFloat("Gyro_Sensitivity_Y"));
 
                     WindowsInput.Simulate.Events().MoveBy(dx, dy).Invoke();
                 }
@@ -927,17 +972,8 @@ namespace BetterJoyForCemu {
                     stick2 = CenterSticks(stick2_precal, stick2_cal, deadzone2, stickScalingFactor2);
                 }
 
-                // Read other Joycon's sticks
-                if (isLeft && other != null && other != this) {
-                    stick2 = otherStick;
-                    other.otherStick = stick;
-                }
-
-                if (!isLeft && other != null && other != this) {
-                    Array.Copy(stick, stick2, 2);
-                    stick = otherStick;
-                    other.otherStick = stick2;
-                }
+                // Stick swapping is now handled in the mapping functions (MapToXbox360Input / MapToDualShock4Input)
+                // to ensure clarity and support for different controller masters.
             }
             //
 
@@ -973,18 +1009,14 @@ namespace BetterJoyForCemu {
                     buttons[(int)Button.STICK2] = ((report_buf[4] & (!isLeft ? 0x08 : 0x04)) != 0);
                     buttons[(int)Button.SHOULDER2_1] = (report_buf[3 + (!isLeft ? 2 : 0)] & 0x40) != 0;
                     buttons[(int)Button.SHOULDER2_2] = (report_buf[3 + (!isLeft ? 2 : 0)] & 0x80) != 0;
+                } else if (!isLeft) { // For Right Joycon, we need to read face buttons from its report section (shared with Pro)
+                    buttons[(int)Button.B] = (report_buf[3] & 0x04) != 0;
+                    buttons[(int)Button.A] = (report_buf[3] & 0x08) != 0;
+                    buttons[(int)Button.X] = (report_buf[3] & 0x02) != 0;
+                    buttons[(int)Button.Y] = (report_buf[3] & 0x01) != 0;
                 }
 
-                if (other != null && other != this) {
-                    buttons[(int)(Button.B)] = other.buttons[(int)Button.DPAD_DOWN];
-                    buttons[(int)(Button.A)] = other.buttons[(int)Button.DPAD_RIGHT];
-                    buttons[(int)(Button.X)] = other.buttons[(int)Button.DPAD_UP];
-                    buttons[(int)(Button.Y)] = other.buttons[(int)Button.DPAD_LEFT];
 
-                    buttons[(int)Button.STICK2] = other.buttons[(int)Button.STICK];
-                    buttons[(int)Button.SHOULDER2_1] = other.buttons[(int)Button.SHOULDER_1];
-                    buttons[(int)Button.SHOULDER2_2] = other.buttons[(int)Button.SHOULDER_2];
-                }
 
                 if (isLeft && other != null && other != this) {
                     buttons[(int)Button.HOME] = other.buttons[(int)Button.HOME];
@@ -1084,7 +1116,7 @@ namespace BetterJoyForCemu {
                     }
                 }
 
-                if (other == null && !isPro) { // single joycon mode; Z do not swap, rest do
+                if (other == null && !isPro && !isVerticalMode && !forceGyroVertical) { // single joycon mode; Z do not swap, rest do
                     if (isLeft) {
                         acc_g.X = -acc_g.X;
                         acc_g.Y = -acc_g.Y;
@@ -1306,6 +1338,9 @@ namespace BetterJoyForCemu {
 
                 PrintArray(gyr_neutral, len: 3, d: DebugType.IMU, format: "Factory gyro neutral position: {0:S}");
             }
+
+            GetBodyColor();
+
             HIDapi.hid_set_nonblocking(handle, 1);
         }
 
@@ -1323,6 +1358,32 @@ namespace BetterJoyForCemu {
             Array.Copy(buf_, 20, read_buf, 0, len);
             if (print) PrintArray(read_buf, DebugType.COMMS, len);
             return read_buf;
+        }
+
+        private void GetBodyColor() {
+            if (thirdParty)
+                return;
+
+            try {
+                // Leer 3 bytes desde 0x6050 (Factory body color)
+                byte[] color_data = ReadSPI(0x60, 0x50, 3);
+
+                // Verificar que no sea 0xFFFFFF (vacío) o 0x000000
+                if ((color_data[0] != 0xFF || color_data[1] != 0xFF || color_data[2] != 0xFF) &&
+                    (color_data[0] != 0x00 || color_data[1] != 0x00 || color_data[2] != 0x00)) {
+                    this.BodyColor = System.Drawing.Color.FromArgb(255, color_data[0], color_data[1], color_data[2]);
+                    DebugPrint($"Joy-Con Color Read: R:{color_data[0]} G:{color_data[1]} B:{color_data[2]}", DebugType.COMMS);
+
+                    form.Invoke(new MethodInvoker(delegate {
+                        BatteryChanged();
+                        if (other != null && other != this) {
+                            other.BatteryChanged();
+                        }
+                    }));
+                }
+            } catch (Exception e) {
+                DebugPrint("Error reading Joy-Con color: " + e.Message, DebugType.COMMS);
+            }
         }
 
         private void PrintArray<T>(T[] arr, DebugType d = DebugType.NONE, uint len = 0, uint start = 0, string format = "{0:S}") {
@@ -1421,32 +1482,38 @@ namespace BetterJoyForCemu {
             return stick_correction;
         }
 
+        private static bool GetMap(string key, bool[] buttons) {
+            Joycon.Button btn = Mappings.GetButton(key);
+            if ((int)btn >= 0 && (int)btn < buttons.Length) return buttons[(int)btn];
+            return false;
+        }
+
         private static OutputControllerXbox360InputState MapToXbox360Input(Joycon input) {
             var output = new OutputControllerXbox360InputState();
 
-
             var swapAB = input.swapAB;
             var swapXY = input.swapXY;
+            var forceABXY = Joycon.LeftJoyConForceABXY;
 
             var isPro = input.isPro;
             var isLeft = input.isLeft;
             var isSnes = input.isSnes;
             var is64 = input.is64;
             var other = input.other;
-            var GyroAnalogSliders = input.GyroAnalogSliders;
+            var GyroStickSliders = input.GyroAnalogSliders;
 
             var buttons = input.buttons;
             var stick = input.stick;
             var stick2 = input.stick2;
             var sliderVal = input.sliderVal;
+            var isVertical = input.isVerticalMode;
 
-            if (is64)
-            {
-                output.axis_right_x = (short) ((buttons[(int)Button.X] ? Int16.MinValue : 0) + (buttons[(int)Button.MINUS] ? Int16.MaxValue : 0));
-                output.axis_right_y = (short) ((buttons[(int)Button.SHOULDER2_2] ? Int16.MinValue: 0) + (buttons[(int)Button.Y] ? Int16.MaxValue: 0));
+            if (is64) {
+                // N64 logic remains relatively specialized, but let's at least use Buttons properly
+                output.axis_right_x = (short)((buttons[(int)Button.X] ? Int16.MinValue : 0) + (buttons[(int)Button.MINUS] ? Int16.MaxValue : 0));
+                output.axis_right_y = (short)((buttons[(int)Button.SHOULDER2_2] ? Int16.MinValue : 0) + (buttons[(int)Button.Y] ? Int16.MaxValue : 0));
 
                 var n64Stick = Getn64StickValues(input);
-
                 output.axis_left_x = CastStickValue(n64Stick[0]);
                 output.axis_left_y = CastStickValue(n64Stick[1]);
 
@@ -1465,92 +1532,130 @@ namespace BetterJoyForCemu {
                 output.dpad_right = buttons[(int)Button.DPAD_RIGHT];
                 output.dpad_up = buttons[(int)Button.DPAD_UP];
                 output.guide = buttons[(int)Button.HOME];
+            } else if (isPro) {
+                string p = "Pro_";
+                output.a = GetMap(p + "Face_A", buttons);
+                output.b = GetMap(p + "Face_B", buttons);
+                output.x = GetMap(p + "Face_X", buttons);
+                output.y = GetMap(p + "Face_Y", buttons);
 
-            }
-            else if (isPro) {
-                output.a = buttons[(int)(!swapAB ? Button.B : Button.A)];
-                output.b = buttons[(int)(!swapAB ? Button.A : Button.B)];
-                output.y = buttons[(int)(!swapXY ? Button.X : Button.Y)];
-                output.x = buttons[(int)(!swapXY ? Button.Y : Button.X)];
+                output.dpad_up = GetMap(p + "Dpad_Up", buttons);
+                output.dpad_down = GetMap(p + "Dpad_Down", buttons);
+                output.dpad_left = GetMap(p + "Dpad_Left", buttons);
+                output.dpad_right = GetMap(p + "Dpad_Right", buttons);
 
-                output.dpad_up = buttons[(int)Button.DPAD_UP];
-                output.dpad_down = buttons[(int)Button.DPAD_DOWN];
-                output.dpad_left = buttons[(int)Button.DPAD_LEFT];
-                output.dpad_right = buttons[(int)Button.DPAD_RIGHT];
+                output.back = GetMap(p + "Back", buttons);
+                output.start = GetMap(p + "Start", buttons);
+                output.guide = GetMap(p + "Guide", buttons);
 
-                output.back = buttons[(int)Button.MINUS];
-                output.start = buttons[(int)Button.PLUS];
-                output.guide = buttons[(int)Button.HOME];
+                output.shoulder_left = GetMap(p + "Shoulder_L", buttons);
+                output.shoulder_right = GetMap(p + "Shoulder_R", buttons);
+                output.trigger_left = (byte)(GetMap(p + "Trigger_L", buttons) ? Byte.MaxValue : 0);
+                output.trigger_right = (byte)(GetMap(p + "Trigger_R", buttons) ? Byte.MaxValue : 0);
 
-                output.shoulder_left = buttons[(int)Button.SHOULDER_1];
-                output.shoulder_right = buttons[(int)Button.SHOULDER2_1];
-
-                output.thumb_stick_left = buttons[(int)Button.STICK];
-                output.thumb_stick_right = buttons[(int)Button.STICK2];
+                output.thumb_stick_left = GetMap(p + "Stick_Click_L", buttons);
+                output.thumb_stick_right = GetMap(p + "Stick_Click_R", buttons);
             } else {
-                if (other != null) { // no need for && other != this
-                    output.a = buttons[(int)(!swapAB ? isLeft ? Button.B : Button.DPAD_DOWN : isLeft ? Button.A : Button.DPAD_RIGHT)];
-                    output.b = buttons[(int)(swapAB ? isLeft ? Button.B : Button.DPAD_DOWN : isLeft ? Button.A : Button.DPAD_RIGHT)];
-                    output.y = buttons[(int)(!swapXY ? isLeft ? Button.X : Button.DPAD_UP : isLeft ? Button.Y : Button.DPAD_LEFT)];
-                    output.x = buttons[(int)(swapXY ? isLeft ? Button.X : Button.DPAD_UP : isLeft ? Button.Y : Button.DPAD_LEFT)];
+                if (other != null) {
+                    Joycon leftCon = isLeft ? input : other;
+                    Joycon rightCon = isLeft ? other : input;
 
-                    output.dpad_up = buttons[(int)(isLeft ? Button.DPAD_UP : Button.X)];
-                    output.dpad_down = buttons[(int)(isLeft ? Button.DPAD_DOWN : Button.B)];
-                    output.dpad_left = buttons[(int)(isLeft ? Button.DPAD_LEFT : Button.Y)];
-                    output.dpad_right = buttons[(int)(isLeft ? Button.DPAD_RIGHT : Button.A)];
+                    string pL = "Joined_Left_";
+                    string pR = "Joined_Right_";
 
-                    output.back = buttons[(int)Button.MINUS];
-                    output.start = buttons[(int)Button.PLUS];
-                    output.guide = buttons[(int)Button.HOME];
+                    // Face Buttons (Right JoyCon)
+                    output.a = GetMap(pR + "Face_A", rightCon.buttons);
+                    output.b = GetMap(pR + "Face_B", rightCon.buttons);
+                    output.x = GetMap(pR + "Face_X", rightCon.buttons);
+                    output.y = GetMap(pR + "Face_Y", rightCon.buttons);
 
-                    output.shoulder_left = buttons[(int)(isLeft ? Button.SHOULDER_1 : Button.SHOULDER2_1)];
-                    output.shoulder_right = buttons[(int)(isLeft ? Button.SHOULDER2_1 : Button.SHOULDER_1)];
+                    // DPads (Left JoyCon)
+                    output.dpad_up = GetMap(pL + "Dpad_Up", leftCon.buttons);
+                    output.dpad_down = GetMap(pL + "Dpad_Down", leftCon.buttons);
+                    output.dpad_left = GetMap(pL + "Dpad_Left", leftCon.buttons);
+                    output.dpad_right = GetMap(pL + "Dpad_Right", leftCon.buttons);
 
-                    output.thumb_stick_left = buttons[(int)(isLeft ? Button.STICK : Button.STICK2)];
-                    output.thumb_stick_right = buttons[(int)(isLeft ? Button.STICK2 : Button.STICK)];
-                } else { // single joycon mode
-                    output.a = buttons[(int)(!swapAB ? isLeft ? Button.DPAD_LEFT : Button.DPAD_RIGHT : isLeft ? Button.DPAD_DOWN : Button.DPAD_UP)];
-                    output.b = buttons[(int)(swapAB ? isLeft ? Button.DPAD_LEFT : Button.DPAD_RIGHT : isLeft ? Button.DPAD_DOWN : Button.DPAD_UP)];
-                    output.y = buttons[(int)(!swapXY ? isLeft ? Button.DPAD_RIGHT : Button.DPAD_LEFT : isLeft ? Button.DPAD_UP : Button.DPAD_DOWN)];
-                    output.x = buttons[(int)(swapXY ? isLeft ? Button.DPAD_RIGHT : Button.DPAD_LEFT : isLeft ? Button.DPAD_UP : Button.DPAD_DOWN)];
+                    // System Buttons
+                    output.back = GetMap(pL + "Back", leftCon.buttons);
+                    output.start = GetMap(pR + "Start", rightCon.buttons);
+                    output.guide = GetMap(pL + "Guide", leftCon.buttons) || GetMap(pR + "Guide", rightCon.buttons);
 
-                    output.back = buttons[(int)Button.MINUS] | buttons[(int)Button.HOME];
-                    output.start = buttons[(int)Button.PLUS] | buttons[(int)Button.CAPTURE];
+                    // Shoulders & Triggers
+                    output.shoulder_left = GetMap(pL + "Shoulder_L", leftCon.buttons);
+                    output.shoulder_right = GetMap(pR + "Shoulder_R", rightCon.buttons);
+                    output.trigger_left = (byte)(GetMap(pL + "Trigger_L", leftCon.buttons) ? Byte.MaxValue : 0);
+                    output.trigger_right = (byte)(GetMap(pR + "Trigger_R", rightCon.buttons) ? Byte.MaxValue : 0);
 
-                    output.shoulder_left = buttons[(int)Button.SL];
-                    output.shoulder_right = buttons[(int)Button.SR];
+                    // Stick Click
+                    output.thumb_stick_left = GetMap(pL + "Stick_Click_L", leftCon.buttons);
+                    output.thumb_stick_right = GetMap(pR + "Stick_Click_R", rightCon.buttons);
 
-                    output.thumb_stick_left = buttons[(int)Button.STICK];
+                    // Axis assignment (Sticks)
+                    output.axis_left_x = CastStickValue(leftCon.stick[0]);
+                    output.axis_left_y = CastStickValue(leftCon.stick[1]);
+                    output.axis_right_x = CastStickValue(rightCon.stick[0]);
+                    output.axis_right_y = CastStickValue(rightCon.stick[1]);
+                }
+ else { // single joycon mode
+                    string side = isLeft ? "Left" : "Right";
+                    string orient = isVertical ? "Vertical" : "Horizontal";
+                    string p = $"Indep_{orient}_{side}_";
+
+                    // Face Buttons
+                    output.a = GetMap(p + "Face_A", buttons);
+                    output.b = GetMap(p + "Face_B", buttons);
+                    output.x = GetMap(p + "Face_X", buttons);
+                    output.y = GetMap(p + "Face_Y", buttons);
+
+
+                    // DPads
+                    output.dpad_up = GetMap(p + "Dpad_Up", buttons);
+                    output.dpad_down = GetMap(p + "Dpad_Down", buttons);
+                    output.dpad_left = GetMap(p + "Dpad_Left", buttons);
+                    output.dpad_right = GetMap(p + "Dpad_Right", buttons);
+
+                    // Shoulders & Triggers
+                    output.shoulder_left = GetMap(p + "Shoulder_L", buttons);
+                    output.shoulder_right = GetMap(p + "Shoulder_R", buttons);
+                    
+                    output.trigger_left = (byte)(GetMap(p + "Trigger_L", buttons) ? Byte.MaxValue : 0);
+                    output.trigger_right = (byte)(GetMap(p + "Trigger_R", buttons) ? Byte.MaxValue : 0);
+
+                    // System Buttons
+                    output.back = GetMap(p + "Back", buttons);
+                    output.start = GetMap(p + "Start", buttons);
+                    output.guide = GetMap(p + "Guide", buttons);
+
+                    // Stick Click
+                    output.thumb_stick_left = GetMap(p + "Stick_Click_L", buttons);
+                    output.thumb_stick_right = GetMap(p + "Stick_Click_R", buttons);
                 }
             }
 
-            // overwrite guide button if it's custom-mapped
             if (Config.Value("home") != "0")
                 output.guide = false;
 
             if (!(isSnes || is64)) {
-                if (other != null || isPro) { // no need for && other != this
-                    output.axis_left_x = CastStickValue((other == input && !isLeft) ? stick2[0] : stick[0]);
-                    output.axis_left_y = CastStickValue((other == input && !isLeft) ? stick2[1] : stick[1]);
-
-                    output.axis_right_x = CastStickValue((other == input && !isLeft) ? stick[0] : stick2[0]);
-                    output.axis_right_y = CastStickValue((other == input && !isLeft) ? stick[1] : stick2[1]);
-                } else { // single joycon mode
+                if (isPro || (isVertical && other == null)) {
+                    // Modo Independiente Vertical
+                    if (isVertical && !isLeft) {
+                        output.axis_left_x = CastStickValue(stick[0]);
+                        output.axis_left_y = CastStickValue(stick[1]);
+                        output.axis_right_x = CastStickValue(stick2[0]);
+                        output.axis_right_y = CastStickValue(stick2[1]);
+                    }
+                    else {
+                        // Comportamiento original para Pro o JoyCon Izquierdo Vertical
+                        output.axis_left_x = CastStickValue((isVertical && !isLeft) ? stick2[0] : stick[0]);
+                        output.axis_left_y = CastStickValue((isVertical && !isLeft) ? stick2[1] : stick[1]);
+                        output.axis_right_x = CastStickValue((isVertical && !isLeft) ? stick[0] : stick2[0]);
+                        output.axis_right_y = CastStickValue((isVertical && !isLeft) ? stick[1] : stick2[1]);
+                    }
+                } else if (other == null) { // single joycon mode
                     output.axis_left_y = CastStickValue((isLeft ? 1 : -1) * stick[0]);
                     output.axis_left_x = CastStickValue((isLeft ? -1 : 1) * stick[1]);
-                }
-            }
-
-            if (!is64)
-            {
-                if (other != null || isPro) {
-                    byte lval = GyroAnalogSliders ? sliderVal[0] : Byte.MaxValue;
-                    byte rval = GyroAnalogSliders ? sliderVal[1] : Byte.MaxValue;
-                    output.trigger_left = (byte)(buttons[(int)(isLeft ? Button.SHOULDER_2 : Button.SHOULDER2_2)] ? lval : 0);
-                    output.trigger_right = (byte)(buttons[(int)(isLeft ? Button.SHOULDER2_2 : Button.SHOULDER_2)] ? rval : 0);
-                } else {
-                    output.trigger_left = (byte)(buttons[(int)(isLeft ? Button.SHOULDER_2 : Button.SHOULDER_1)] ? Byte.MaxValue : 0);
-                    output.trigger_right = (byte)(buttons[(int)(isLeft ? Button.SHOULDER_1 : Button.SHOULDER_2)] ? Byte.MaxValue : 0);
+                    output.axis_right_x = CastStickValue(stick2[0]);
+                    output.axis_right_y = CastStickValue(stick2[1]);
                 }
             }
 
@@ -1570,15 +1675,17 @@ namespace BetterJoyForCemu {
             var other = input.other;
             var GyroAnalogSliders = input.GyroAnalogSliders;
 
+            var isVertical = input.isVerticalMode;
+
             var buttons = input.buttons;
             var stick = input.stick;
             var stick2 = input.stick2;
             var sliderVal = input.sliderVal;
 
-            if (is64)
-            {
-                output.thumb_right_x = (byte) ((buttons[(int)Button.X] ? Byte.MinValue : 0) + (buttons[(int)Button.MINUS] ? Byte.MaxValue : 0));
-                output.thumb_right_y = (byte) ((buttons[(int)Button.SHOULDER2_2] ? Byte.MinValue: 0) + (buttons[(int)Button.Y] ? Byte.MaxValue: 0));
+
+            if (is64) {
+                output.thumb_right_x = (byte)((buttons[(int)Button.X] ? Byte.MinValue : 0) + (buttons[(int)Button.MINUS] ? Byte.MaxValue : 0));
+                output.thumb_right_y = (byte)((buttons[(int)Button.SHOULDER2_2] ? Byte.MinValue : 0) + (buttons[(int)Button.Y] ? Byte.MaxValue : 0));
 
                 output.thumb_left_x = CastStickValueByte((other == input && !isLeft) ? -stick2[0] : -stick[0]);
                 output.thumb_left_y = CastStickValueByte((other == input && !isLeft) ? stick2[1] : stick[1]);
@@ -1613,90 +1720,122 @@ namespace BetterJoyForCemu {
                 } else if (buttons[(int)Button.DPAD_LEFT])
                     output.dPad = DpadDirection.West;
                 else if (buttons[(int)Button.DPAD_RIGHT])
-                    output.dPad = DpadDirection.East;                
-            }
-
-            if (isPro) {
-                output.cross = buttons[(int)(!swapAB ? Button.B : Button.A)];
-                output.circle = buttons[(int)(!swapAB ? Button.A : Button.B)];
-                output.triangle = buttons[(int)(!swapXY ? Button.X : Button.Y)];
-                output.square = buttons[(int)(!swapXY ? Button.Y : Button.X)];
-
-
-                if (buttons[(int)Button.DPAD_UP]) {
-                    if (buttons[(int)Button.DPAD_LEFT])
-                        output.dPad = DpadDirection.Northwest;
-                    else if (buttons[(int)Button.DPAD_RIGHT])
-                        output.dPad = DpadDirection.Northeast;
-                    else
-                        output.dPad = DpadDirection.North;
-                } else if (buttons[(int)Button.DPAD_DOWN]) {
-                    if (buttons[(int)Button.DPAD_LEFT])
-                        output.dPad = DpadDirection.Southwest;
-                    else if (buttons[(int)Button.DPAD_RIGHT])
-                        output.dPad = DpadDirection.Southeast;
-                    else
-                        output.dPad = DpadDirection.South;
-                } else if (buttons[(int)Button.DPAD_LEFT])
-                    output.dPad = DpadDirection.West;
-                else if (buttons[(int)Button.DPAD_RIGHT])
                     output.dPad = DpadDirection.East;
+            } else if (isPro) {
+                string p = "Pro_";
+                output.cross = GetMap(p + "Face_A", buttons);
+                output.circle = GetMap(p + "Face_B", buttons);
+                output.triangle = GetMap(p + "Face_X", buttons);
+                output.square = GetMap(p + "Face_Y", buttons);
 
-                output.share = buttons[(int)Button.CAPTURE];
-                output.options = buttons[(int)Button.PLUS];
-                output.ps = buttons[(int)Button.HOME];
-                output.touchpad = buttons[(int)Button.MINUS];
-                output.shoulder_left = buttons[(int)Button.SHOULDER_1];
-                output.shoulder_right = buttons[(int)Button.SHOULDER2_1];
-                output.thumb_left = buttons[(int)Button.STICK];
-                output.thumb_right = buttons[(int)Button.STICK2];
+                bool up = GetMap(p + "Dpad_Up", buttons);
+                bool down = GetMap(p + "Dpad_Down", buttons);
+                bool left = GetMap(p + "Dpad_Left", buttons);
+                bool right = GetMap(p + "Dpad_Right", buttons);
+
+                if (up) {
+                    if (left) output.dPad = DpadDirection.Northwest;
+                    else if (right) output.dPad = DpadDirection.Northeast;
+                    else output.dPad = DpadDirection.North;
+                } else if (down) {
+                    if (left) output.dPad = DpadDirection.Southwest;
+                    else if (right) output.dPad = DpadDirection.Southeast;
+                    else output.dPad = DpadDirection.South;
+                } else if (left) output.dPad = DpadDirection.West;
+                else if (right) output.dPad = DpadDirection.East;
+                else output.dPad = DpadDirection.None;
+
+                output.share = GetMap(p + "Touchpad", buttons); // Capture is Touchpad in DS4/Pro context? Verify
+                output.options = GetMap(p + "Start", buttons);
+                output.ps = GetMap(p + "Guide", buttons);
+                output.touchpad = GetMap(p + "Back", buttons); // Minus as Touchpad?
+                output.shoulder_left = GetMap(p + "Shoulder_L", buttons);
+                output.shoulder_right = GetMap(p + "Shoulder_R", buttons);
+                output.thumb_left = GetMap(p + "Stick_Click_L", buttons);
+                output.thumb_right = GetMap(p + "Stick_Click_R", buttons);
             } else {
-                if (other != null) { // no need for && other != this
-                    output.cross = !swapAB ? buttons[(int)(isLeft ? Button.B : Button.DPAD_DOWN)] : buttons[(int)(isLeft ? Button.A : Button.DPAD_RIGHT)];
-                    output.circle = swapAB ? buttons[(int)(isLeft ? Button.B : Button.DPAD_DOWN)] : buttons[(int)(isLeft ? Button.A : Button.DPAD_RIGHT)];
-                    output.triangle = !swapXY ? buttons[(int)(isLeft ? Button.X : Button.DPAD_UP)] : buttons[(int)(isLeft ? Button.Y : Button.DPAD_LEFT)];
-                    output.square = swapXY ? buttons[(int)(isLeft ? Button.X : Button.DPAD_UP)] : buttons[(int)(isLeft ? Button.Y : Button.DPAD_LEFT)];
+                if (other != null) {
+                    Joycon leftCon = isLeft ? input : other;
+                    Joycon rightCon = isLeft ? other : input;
 
-                    if (buttons[(int)(isLeft ? Button.DPAD_UP : Button.X)])
-                        if (buttons[(int)(isLeft ? Button.DPAD_LEFT : Button.Y)])
-                            output.dPad = DpadDirection.Northwest;
-                        else if (buttons[(int)(isLeft ? Button.DPAD_RIGHT : Button.A)])
-                            output.dPad = DpadDirection.Northeast;
-                        else
-                            output.dPad = DpadDirection.North;
-                    else if (buttons[(int)(isLeft ? Button.DPAD_DOWN : Button.B)])
-                        if (buttons[(int)(isLeft ? Button.DPAD_LEFT : Button.Y)])
-                            output.dPad = DpadDirection.Southwest;
-                        else if (buttons[(int)(isLeft ? Button.DPAD_RIGHT : Button.A)])
-                            output.dPad = DpadDirection.Southeast;
-                        else
-                            output.dPad = DpadDirection.South;
-                    else if (buttons[(int)(isLeft ? Button.DPAD_LEFT : Button.Y)])
-                        output.dPad = DpadDirection.West;
-                    else if (buttons[(int)(isLeft ? Button.DPAD_RIGHT : Button.A)])
-                        output.dPad = DpadDirection.East;
+                    string pL = "Joined_Left_";
+                    string pR = "Joined_Right_";
 
-                    output.share = buttons[(int)Button.CAPTURE];
-                    output.options = buttons[(int)Button.PLUS];
-                    output.ps = buttons[(int)Button.HOME];
-                    output.touchpad = buttons[(int)Button.MINUS];
-                    output.shoulder_left = buttons[(int)(isLeft ? Button.SHOULDER_1 : Button.SHOULDER2_1)];
-                    output.shoulder_right = buttons[(int)(isLeft ? Button.SHOULDER2_1 : Button.SHOULDER_1)];
-                    output.thumb_left = buttons[(int)(isLeft ? Button.STICK : Button.STICK2)];
-                    output.thumb_right = buttons[(int)(isLeft ? Button.STICK2 : Button.STICK)];
-                } else { // single joycon mode
-                    output.cross = !swapAB ? buttons[(int)(isLeft ? Button.DPAD_LEFT : Button.DPAD_RIGHT)] : buttons[(int)(isLeft ? Button.DPAD_DOWN : Button.DPAD_UP)];
-                    output.circle = swapAB ? buttons[(int)(isLeft ? Button.DPAD_LEFT : Button.DPAD_RIGHT)] : buttons[(int)(isLeft ? Button.DPAD_DOWN : Button.DPAD_UP)];
-                    output.triangle = !swapXY ? buttons[(int)(isLeft ? Button.DPAD_RIGHT : Button.DPAD_LEFT)] : buttons[(int)(isLeft ? Button.DPAD_UP : Button.DPAD_DOWN)];
-                    output.square = swapXY ? buttons[(int)(isLeft ? Button.DPAD_RIGHT : Button.DPAD_LEFT)] : buttons[(int)(isLeft ? Button.DPAD_UP : Button.DPAD_DOWN)];
+                    output.cross = GetMap(pR + "Face_A", rightCon.buttons);
+                    output.circle = GetMap(pR + "Face_B", rightCon.buttons);
+                    output.triangle = GetMap(pR + "Face_X", rightCon.buttons);
+                    output.square = GetMap(pR + "Face_Y", rightCon.buttons);
 
-                    output.ps = buttons[(int)Button.MINUS] | buttons[(int)Button.HOME];
-                    output.options = buttons[(int)Button.PLUS] | buttons[(int)Button.CAPTURE];
+                    bool up = GetMap(pL + "Dpad_Up", leftCon.buttons);
+                    bool down = GetMap(pL + "Dpad_Down", leftCon.buttons);
+                    bool left = GetMap(pL + "Dpad_Left", leftCon.buttons);
+                    bool right = GetMap(pL + "Dpad_Right", leftCon.buttons);
 
-                    output.shoulder_left = buttons[(int)Button.SL];
-                    output.shoulder_right = buttons[(int)Button.SR];
+                    if (up) {
+                        if (left) output.dPad = DpadDirection.Northwest;
+                        else if (right) output.dPad = DpadDirection.Northeast;
+                        else output.dPad = DpadDirection.North;
+                    } else if (down) {
+                        if (left) output.dPad = DpadDirection.Southwest;
+                        else if (right) output.dPad = DpadDirection.Southeast;
+                        else output.dPad = DpadDirection.South;
+                    } else if (left) output.dPad = DpadDirection.West;
+                    else if (right) output.dPad = DpadDirection.East;
+                    else output.dPad = DpadDirection.None;
 
-                    output.thumb_left = buttons[(int)Button.STICK];
+                    output.share = isLeft ? GetMap(pL + "Touchpad", leftCon.buttons) : GetMap(pR + "Touchpad", rightCon.buttons);
+                    output.options = GetMap(pR + "Start", rightCon.buttons);
+                    output.ps = GetMap(pL + "Guide", leftCon.buttons) || GetMap(pR + "Guide", rightCon.buttons);
+                    output.touchpad = GetMap(pL + "Back", leftCon.buttons);
+                    output.shoulder_left = GetMap(pL + "Shoulder_L", leftCon.buttons);
+                    output.shoulder_right = GetMap(pR + "Shoulder_R", rightCon.buttons);
+                    output.thumb_left = GetMap(pL + "Stick_Click_L", leftCon.buttons);
+                    output.thumb_right = GetMap(pR + "Stick_Click_R", rightCon.buttons);
+
+                    // Axis assignment (Sticks)
+                    output.thumb_left_x = CastStickValueByte(-leftCon.stick[0]);
+                    output.thumb_left_y = CastStickValueByte(leftCon.stick[1]);
+                    output.thumb_right_x = CastStickValueByte(-rightCon.stick[0]);
+                    output.thumb_right_y = CastStickValueByte(rightCon.stick[1]);
+                }
+ else { // single joycon mode
+                    string side = isLeft ? "Left" : "Right";
+                    string orient = isVertical ? "Vertical" : "Horizontal";
+                    string p = $"Indep_{orient}_{side}_";
+
+                    output.cross = GetMap(p + "Face_A", buttons);
+                    output.circle = GetMap(p + "Face_B", buttons);
+                    output.square = GetMap(p + "Face_X", buttons);
+                    output.triangle = GetMap(p + "Face_Y", buttons);
+
+                    output.ps = GetMap(p + "Guide", buttons);
+                    output.options = GetMap(p + "Start", buttons);
+                    output.share = GetMap(p + "Back", buttons);
+                    output.touchpad = GetMap(p + "Touchpad", buttons);
+
+                    output.shoulder_left = GetMap(p + "Shoulder_L", buttons);
+                    output.shoulder_right = GetMap(p + "Shoulder_R", buttons);
+                    
+                    output.thumb_left = GetMap(p + "Stick_Click_L", buttons);
+                    output.thumb_right = GetMap(p + "Stick_Click_R", buttons);
+
+                    // DPads (DS4 uses enum for Dpad)
+                    bool up = GetMap(p + "Dpad_Up", buttons);
+                    bool down = GetMap(p + "Dpad_Down", buttons);
+                    bool left = GetMap(p + "Dpad_Left", buttons);
+                    bool right = GetMap(p + "Dpad_Right", buttons);
+
+                    if (up) {
+                        if (left) output.dPad = DpadDirection.Northwest;
+                        else if (right) output.dPad = DpadDirection.Northeast;
+                        else output.dPad = DpadDirection.North;
+                    } else if (down) {
+                        if (left) output.dPad = DpadDirection.Southwest;
+                        else if (right) output.dPad = DpadDirection.Southeast;
+                        else output.dPad = DpadDirection.South;
+                    } else if (left) output.dPad = DpadDirection.West;
+                    else if (right) output.dPad = DpadDirection.East;
+                    else output.dPad = DpadDirection.None;
                 }
             }
 
@@ -1705,12 +1844,20 @@ namespace BetterJoyForCemu {
                 output.ps = false;
 
             if (!(isSnes || is64)) {
-                if (other != null || isPro) { // no need for && other != this
-                    output.thumb_left_x = CastStickValueByte((other == input && !isLeft) ? -stick2[0] : -stick[0]);
-                    output.thumb_left_y = CastStickValueByte((other == input && !isLeft) ? stick2[1] : stick[1]);
-                    output.thumb_right_x = CastStickValueByte((other == input && !isLeft) ? -stick[0] : -stick2[0]);
-                    output.thumb_right_y = CastStickValueByte((other == input && !isLeft) ? stick[1] : stick2[1]);
-                } else { // single joycon mode
+                if (isPro || (isVertical && other == null)) {
+                    if (isVertical && !isLeft) {
+                        output.thumb_left_x = CastStickValueByte(-stick[0]);
+                        output.thumb_left_y = CastStickValueByte(stick[1]);
+                        
+                        output.thumb_right_x = CastStickValueByte(-stick2[0]);
+                        output.thumb_right_y = CastStickValueByte(stick2[1]);
+                    } else {
+                        output.thumb_left_x = CastStickValueByte((isVertical && !isLeft) ? -stick2[0] : -stick[0]);
+                        output.thumb_left_y = CastStickValueByte((isVertical && !isLeft) ? stick2[1] : stick[1]);
+                        output.thumb_right_x = CastStickValueByte((isVertical && !isLeft) ? -stick[0] : -stick2[0]);
+                        output.thumb_right_y = CastStickValueByte((isVertical && !isLeft) ? stick[1] : stick2[1]);
+                    }
+                } else if (other == null) { 
                     output.thumb_left_y = CastStickValueByte((isLeft ? 1 : -1) * stick[0]);
                     output.thumb_left_x = CastStickValueByte((isLeft ? 1 : -1) * stick[1]);
                 }
@@ -1718,14 +1865,18 @@ namespace BetterJoyForCemu {
 
             if (!is64)
             {
-                if (other != null || isPro) {
+                if (other != null || isPro || isVertical) {
                     byte lval = GyroAnalogSliders ? sliderVal[0] : Byte.MaxValue;
                     byte rval = GyroAnalogSliders ? sliderVal[1] : Byte.MaxValue;
                     output.trigger_left_value = (byte)(buttons[(int)(isLeft ? Button.SHOULDER_2 : Button.SHOULDER2_2)] ? lval : 0);
                     output.trigger_right_value = (byte)(buttons[(int)(isLeft ? Button.SHOULDER2_2 : Button.SHOULDER_2)] ? rval : 0);
                 } else {
-                    output.trigger_left_value = (byte)(buttons[(int)(isLeft ? Button.SHOULDER_2 : Button.SHOULDER_1)] ? Byte.MaxValue : 0);
-                    output.trigger_right_value = (byte)(buttons[(int)(isLeft ? Button.SHOULDER_1 : Button.SHOULDER_2)] ? Byte.MaxValue : 0);
+                    string side = isLeft ? "Left" : "Right";
+                    string orient = isVertical ? "Vertical" : "Horizontal";
+                    string p = $"Indep_{orient}_{side}_";
+
+                    output.trigger_left_value = (byte)(GetMap(p + "Trigger_L", buttons) ? Byte.MaxValue : 0);
+                    output.trigger_right_value = (byte)(GetMap(p + "Trigger_R", buttons) ? Byte.MaxValue : 0);
                 }
             // Output digital L2 / R2 in addition to analog L2 / R2
             output.trigger_left = output.trigger_left_value > 0 ? output.trigger_left = true : output.trigger_left = false;

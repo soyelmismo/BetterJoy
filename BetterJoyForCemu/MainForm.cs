@@ -96,7 +96,9 @@ namespace BetterJoyForCemu {
         }
 
         private void MainForm_Load(object sender, EventArgs e) {
+            Mappings.form = this;
             Config.Init(caliData);
+            Mappings.Load();
 
             Program.Start();
 
@@ -147,7 +149,7 @@ namespace BetterJoyForCemu {
         bool showAsXInput = Boolean.Parse(ConfigurationManager.AppSettings["ShowAsXInput"]);
         bool showAsDS4 = Boolean.Parse(ConfigurationManager.AppSettings["ShowAsDS4"]);
 
-        public async void locBtnClickAsync(object sender, EventArgs e) {
+        public async void locBtnClickAsync(object sender, MouseEventArgs e) {
             Button bb = sender as Button;
 
             if (bb.Tag.GetType() == typeof(Button)) {
@@ -164,61 +166,87 @@ namespace BetterJoyForCemu {
 
         bool doNotRejoin = Boolean.Parse(ConfigurationManager.AppSettings["DoNotRejoinJoycons"]);
 
-        public void conBtnClick(object sender, EventArgs e) {
+        public void conBtnClick(object sender, MouseEventArgs e) {
             Button button = sender as Button;
 
             if (button.Tag.GetType() == typeof(Joycon)) {
                 Joycon v = (Joycon)button.Tag;
 
-                if (v.other == null && !v.isPro) { // needs connecting to other joycon (so messy omg)
-                    bool succ = false;
+                // --- LÓGICA CLICK DERECHO (Emparejar o Forzar Gyro) ---
+                if (e.Button == MouseButtons.Right) {
+                    if (!v.isPro && v.other == null) {
+                        // Si ya está en modo Vertical (por click izquierdo) o ya tiene el gyro forzado, buscamos pareja
+                        if (v.isVerticalMode) {
+                            bool succ = false;
+                            foreach (Joycon jc in Program.mgr.j) {
+                                // Buscamos pareja que también esté en un estado Vertical (isVerticalMode o forceGyroVertical)
+                                if (!jc.isPro && jc.isLeft != v.isLeft && jc != v && jc.other == null && (jc.isVerticalMode || jc.forceGyroVertical)) {
+                                    v.other = jc;
+                                    jc.other = v;
+                                    v.isVerticalMode = false; 
+                                    jc.isVerticalMode = false;
+                                    v.forceGyroVertical = false; 
+                                    jc.forceGyroVertical = false;
+                                    // Siempre el Joy-Con DERECHO pierde su controller virtual
+                                    // El Joy-Con IZQUIERDO será el "master" que produce la salida
+                                    Joycon rightJoy = v.isLeft ? jc : v;
+                                    if (rightJoy.out_xbox != null) { rightJoy.out_xbox.Disconnect(); rightJoy.out_xbox = null; }
+                                    if (rightJoy.out_ds4 != null) { rightJoy.out_ds4.Disconnect(); rightJoy.out_ds4 = null; }
 
-                    if (Program.mgr.j.Count == 1 || doNotRejoin) { // when want to have a single joycon in vertical mode
-                        v.other = v; // hacky; implement check in Joycon.cs to account for this
-                        succ = true;
-                    } else {
-                        foreach (Joycon jc in Program.mgr.j) {
-                            if (!jc.isPro && jc.isLeft != v.isLeft && jc != v && jc.other == null) {
-                                v.other = jc;
-                                jc.other = v;
-
-                                if (v.out_xbox != null) {
-                                    v.out_xbox.Disconnect();
-                                    v.out_xbox = null;
+                                    foreach (Button b in con) {
+                                        if (b.Tag == jc) b.BackgroundImage = jc.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
+                                        if (b.Tag == v) b.BackgroundImage = v.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
+                                    }
+                                    succ = true;
+                                    AppendTextBox("JoyCons emparejados exitosamente.\r\n");
+                                    break;
                                 }
-
-                                if (v.out_ds4 != null) {
-                                    v.out_ds4.Disconnect();
-                                    v.out_ds4 = null;
-                                }
-
-                                // setting the other joycon's button image
-                                foreach (Button b in con)
-                                    if (b.Tag == jc)
-                                        b.BackgroundImage = jc.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
-
-                                succ = true;
-                                break;
                             }
+                            if (!succ) {
+                                AppendTextBox("No se encontró pareja en modo Vertical.\r\n");
+                            }
+                        } else if (!v.isVerticalMode) {
+                            // Si está en Horizontal, el click derecho switchea solo el gyro (Solo Gyro)
+                            v.forceGyroVertical = !v.forceGyroVertical;
+                            AppendTextBox("JoyCon " + v.PadId + ": Gyro forzado a " + (v.forceGyroVertical ? "Vertical" : "Horizontal") + ".\r\n");
                         }
                     }
+                    return;
+                }
 
-                    if (succ)
-                        foreach (Button b in con)
-                            if (b.Tag == v)
-                                b.BackgroundImage = v.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
-                } else if (v.other != null && !v.isPro) { // needs disconnecting from other joycon
-                    ReenableViGEm(v);
-                    ReenableViGEm(v.other);
+                // --- LÓGICA CLICK IZQUIERDO (Toggle Modo / Separar) ---
+                if (e.Button == MouseButtons.Left) {
+                    if (!v.isPro) {
+                        if (v.other != null) {
+                            // Separar mandos unidos
+                            Joycon other = v.other;
+                            ReenableViGEm(v);
+                            if (other != v) ReenableViGEm(other);
 
-                    button.BackgroundImage = v.isLeft ? Properties.Resources.jc_left_s : Properties.Resources.jc_right_s;
-
-                    foreach (Button b in con)
-                        if (b.Tag == v.other)
-                            b.BackgroundImage = v.other.isLeft ? Properties.Resources.jc_left_s : Properties.Resources.jc_right_s;
-
-                    v.other.other = null;
-                    v.other = null;
+                            foreach (Button b in con) {
+                                if (b.Tag == v || (other != v && b.Tag == other)) {
+                                    Joycon curr = (Joycon)b.Tag;
+                                    b.BackgroundImage = curr.isLeft ? Properties.Resources.jc_left_s : Properties.Resources.jc_right_s;
+                                    curr.isVerticalMode = false;
+                                    curr.forceGyroVertical = false;
+                                    if (curr != v) curr.other = null;
+                                }
+                            }
+                            v.other = null;
+                            AppendTextBox("JoyCons separados y reseteados a Horizontal.\r\n");
+                        } else {
+                            // Alternar entre modo Horizontal y Vertical estándar (Cambiando el icono)
+                            v.isVerticalMode = !v.isVerticalMode;
+                            v.forceGyroVertical = false; // El modo vertical completo anula el forzado de gyro
+                            
+                            button.BackgroundImage = v.isVerticalMode ? 
+                                (v.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right) : 
+                                (v.isLeft ? Properties.Resources.jc_left_s : Properties.Resources.jc_right_s);
+                                
+                            AppendTextBox("JoyCon " + v.PadId + ": Modo " + (v.isVerticalMode ? "Vertical" : "Horizontal") + ".\r\n");
+                        }
+                        Mappings.Load();
+                    }
                 }
             }
         }

@@ -21,6 +21,8 @@ namespace BetterJoyForCemu {
 					return "key_" + ((int)WindowsInput.Events.KeyCode.PrintScreen);
 				case "reset_mouse":
 					return "joy_" + ((int)Joycon.Button.STICK);
+				case "active_gyro":
+					return "joy_" + ((int)Joycon.Button.STICK);
 			}
 			return "0";
 		}

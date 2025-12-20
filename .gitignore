@@ -265,3 +265,8 @@ __pycache__/
 /title.pdn
 /Drivers
 /! Install the drivers in the Drivers folder
+nuget.exe
+comp.bat
+
+*.resx
+digest.txt

@@ -136,6 +136,7 @@
     <Compile Include="Controller\OutputControllerXbox360.cs" />
     <Compile Include="HIDapi.cs" />
     <Compile Include="Joycon.cs" />
+    <Compile Include="Mappings.cs" />
     <Compile Include="MadgwickAHRS.cs" />
     <Compile Include="MainForm.cs">
       <SubType>Form</SubType>
