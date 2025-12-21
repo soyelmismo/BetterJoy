@@ -228,12 +228,14 @@ namespace BetterJoyForCemu {
                                 v.Invoke(new MethodInvoker(delegate {
                                     v.Tag = j.Last(); // assign controller to button
                                     v.Enabled = true;
+                                    v.MouseDown -= new MouseEventHandler(form.conBtnClick);
                                     v.MouseDown += new MouseEventHandler(form.conBtnClick);
                                     v.BackgroundImage = temp;
                                 }));
 
                                 form.loc[ii].Invoke(new MethodInvoker(delegate {
                                     form.loc[ii].Tag = v;
+                                    form.loc[ii].MouseDown -= new MouseEventHandler(form.locBtnClickAsync);
                                     form.loc[ii].MouseDown += new MouseEventHandler(form.locBtnClickAsync);
                                 }));
 

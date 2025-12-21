@@ -164,8 +164,6 @@ namespace BetterJoyForCemu {
             }
         }
 
-        bool doNotRejoin = Boolean.Parse(ConfigurationManager.AppSettings["DoNotRejoinJoycons"]);
-
         public void conBtnClick(object sender, MouseEventArgs e) {
             Button button = sender as Button;
 
