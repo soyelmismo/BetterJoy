@@ -32,6 +32,8 @@ namespace BetterJoyForCemu {
         private const ushort product_snes = 0x2017;
         private const ushort product_n64 = 0x2019;
 
+        public ConcurrentDictionary<string, string> joinedConnectionCache = new ConcurrentDictionary<string, string>();
+
         public ConcurrentList<Joycon> j { get; private set; } // Array of all connected Joy-Cons
         static JoyconManager instance;
 
@@ -66,8 +68,17 @@ namespace BetterJoyForCemu {
             List<Joycon> rem = new List<Joycon>();
             foreach (Joycon joycon in j) {
                 if (joycon.state == Joycon.state_.DROPPED) {
-                    if (joycon.other != null)
-                        joycon.other.other = null; // The other of the other is the joycon itself
+                    // --- INICIO CAMBIO: Guardar en memoria antes de separar ---
+                    if (joycon.other != null) {
+                        string mySerial = joycon.serial_number;
+                        string otherSerial = joycon.other.serial_number;
+
+                        // Guardamos la relación de forma segura
+                        joinedConnectionCache.TryAdd(mySerial, otherSerial);
+                        joinedConnectionCache.TryAdd(otherSerial, mySerial);
+                        
+                        joycon.other.other = null; 
+                    }
 
                     joycon.Detach(true);
                     rem.Add(joycon);
@@ -199,10 +210,53 @@ namespace BetterJoyForCemu {
                     bool isPro = prod_id == product_pro;
                     bool isSnes = prod_id == product_snes;
                     bool is64 = prod_id == product_n64;
+
                     j.Add(new Joycon(handle, EnableIMU, EnableLocalize & EnableIMU, 0.05f, isLeft, enumerate.path, enumerate.serial_number, j.Count, isPro, isSnes, is64,thirdParty != null));
 
                     foundNew = true;
-                    j.Last().form = form;
+                    Joycon newJoy = j.Last(); // Referencia al nuevo joycon
+                    newJoy.form = form;
+
+                    // --- INICIO CAMBIO: Lógica de Auto-Rejoin ---
+                    if (!newJoy.isPro && joinedConnectionCache.ContainsKey(newJoy.serial_number)) {
+                        string targetSerial = joinedConnectionCache[newJoy.serial_number];
+                        Joycon partner = null;
+
+                        // Buscar si la pareja ya está conectada
+                        foreach (var c in j) {
+                            if (c.serial_number == targetSerial && c != newJoy && c.state > Joycon.state_.DROPPED) {
+                                partner = c;
+                                break;
+                            }
+                        }
+
+                        if (partner != null) {
+                            // Restaurar vínculo
+                            newJoy.other = partner;
+                            partner.other = newJoy;
+
+                            // Resetear flags para asegurar comportamiento "Joined"
+                            newJoy.isVerticalMode = false;
+                            partner.isVerticalMode = false;
+                            newJoy.forceGyroVertical = false;
+                            partner.forceGyroVertical = false;
+
+                            // Desconectar el controlador virtual del derecho (slave logic)
+                            Joycon rightJoy = newJoy.isLeft ? partner : newJoy;
+                            if (rightJoy.out_xbox != null) { rightJoy.out_xbox.Disconnect(); rightJoy.out_xbox = null; }
+                            if (rightJoy.out_ds4 != null) { rightJoy.out_ds4.Disconnect(); rightJoy.out_ds4 = null; }
+
+                            // Actualizar Iconos en UI
+                            form.Invoke(new MethodInvoker(delegate {
+                                foreach (Button b in form.con) {
+                                    if (b.Tag == newJoy) b.BackgroundImage = newJoy.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
+                                    if (b.Tag == partner) b.BackgroundImage = partner.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
+                                }
+                                form.AppendTextBox($"JoyCons auto-rejoined: {newJoy.serial_number} & {partner.serial_number}\r\n");
+                            }));
+                        }
+                    }
+                    // --- FIN CAMBIO ---
 
                     if (j.Count < 5) {
                         int ii = -1;

@@ -21,6 +21,7 @@ namespace BetterJoyForCemu {
         public bool is64 = false;
         public bool isVerticalMode = false;
         public bool forceGyroVertical = false;
+        public float BatteryVoltage = 0f; // Variable para almacenar el voltaje
         bool isUSB = false;
         private Joycon _other = null;
 
@@ -248,6 +249,10 @@ namespace BetterJoyForCemu {
 
         private Rumble rumble_obj;
 
+        private long lastRumbleTime = 0;
+        private float[] lastRumbleData = new float[3]; 
+
+
         private byte global_count = 0;
         private string debug_str;
 
@@ -464,8 +469,9 @@ namespace BetterJoyForCemu {
             Subcommand(0x3, new byte[] { 0x30 }, 1);
             DebugPrint("Done with init.", DebugType.COMMS);
 
-            HIDapi.hid_set_nonblocking(handle, 1);
+            UpdateVoltage();
 
+            HIDapi.hid_set_nonblocking(handle, 1);
             return 0;
         }
 
@@ -539,12 +545,51 @@ namespace BetterJoyForCemu {
             }
         }
 
+        public void UpdateVoltage() {
+            if (state < state_.ATTACHED) return;
+
+            new Thread(() => {
+                try {
+                    // Pide voltaje
+                    byte[] response = Subcommand(0x50, new byte[] { 0 }, 1, false);
+
+                    if (response != null && response.Length >= 17) {
+                        int mV = response[15] | (response[16] << 8);
+                        
+                        // --- DEBUG: Imprimir lo que lee el mando ---
+                        string debugMsg = String.Format("JoyCon {0} Raw Voltage: {1}mV", PadId, mV);
+                        form.AppendTextBox(debugMsg + "\r\n");
+                        // -------------------------------------------
+
+                        if (mV > 2800 && mV < 5500) { 
+                            this.BatteryVoltage = mV / 1000.0f;
+                            
+                            if (form != null) {
+                                form.Invoke(new MethodInvoker(delegate {
+                                    form.Refresh();
+                                }));
+                            }
+                        } 
+                        // --- DEBUG: Avisar si el rango lo descarta ---
+                        else {
+                            form.AppendTextBox(String.Format("JoyCon {0} Voltage {1}mV OUT OF RANGE (Ignored)\r\n", PadId, mV));
+                        }
+                        // ---------------------------------------------
+                    }
+                } catch (Exception ex) { 
+                    form.AppendTextBox("Error reading voltage: " + ex.Message + "\r\n");
+                }
+            }).Start();
+        }
+
         public void SetFilterCoeff(float a) {
             filterweight = a;
         }
 
         public void Detach(bool close = false) {
             stop_polling = true;
+
+            this.BatteryVoltage = 0f; // Reset battery voltage
 
             if (out_xbox != null) {
                 out_xbox.Disconnect();
@@ -1185,6 +1230,24 @@ namespace BetterJoyForCemu {
 
         public void SetRumble(float low_freq, float high_freq, float amp) {
             if (state <= Joycon.state_.ATTACHED) return;
+
+            // Optimización: No enviar si los datos son iguales a los anteriores
+            if (Math.Abs(lastRumbleData[0] - low_freq) < 0.1f && 
+                Math.Abs(lastRumbleData[1] - high_freq) < 0.1f && 
+                Math.Abs(lastRumbleData[2] - amp) < 0.01f) {
+                return;
+            }
+
+            // Optimización: Rate Limiting (ej. máx 1 actualización cada 15ms)
+            long now = Stopwatch.GetTimestamp();
+            if ((now - lastRumbleTime) / 10000 < 15) return; 
+
+            // Actualizar estado
+            lastRumbleData[0] = low_freq;
+            lastRumbleData[1] = high_freq;
+            lastRumbleData[2] = amp;
+            lastRumbleTime = now;
+
             rumble_obj.set_vals(low_freq, high_freq, amp);
         }
 

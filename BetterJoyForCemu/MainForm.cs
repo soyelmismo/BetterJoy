@@ -45,6 +45,11 @@ namespace BetterJoyForCemu {
                 AutoCalibrate.Hide();
 
             con = new List<Button> { con1, con2, con3, con4 };
+
+            foreach(Button b in con) {
+                b.Paint += new PaintEventHandler(conBtn_Paint);
+            }
+
             loc = new List<Button> { loc1, loc2, loc3, loc4 };
 
             //list all options
@@ -64,6 +69,25 @@ namespace BetterJoyForCemu {
 
                 childControl.MouseClick += cbBox_Changed;
                 settingsTable.Controls.Add(childControl, 1, i);
+            }
+        }
+
+        private void conBtn_Paint(object sender, PaintEventArgs e) {
+            Button btn = (Button)sender;
+            if (btn.Tag != null && btn.Tag is Joycon) {
+                Joycon j = (Joycon)btn.Tag;
+                
+                // Solo dibujar si tenemos un voltaje válido (> 0)
+                if (j.BatteryVoltage > 0) {
+                    string voltText = string.Format("{0:0.00}V", j.BatteryVoltage);
+                    
+                    using (Font font = new Font("Arial", 8, FontStyle.Bold)) {
+                        SizeF textSize = e.Graphics.MeasureString(voltText, font);
+                        PointF location = new PointF(btn.Width - textSize.Width - 2, btn.Height - textSize.Height - 2);
+                        e.Graphics.DrawString(voltText, font, Brushes.Black, location.X + 1, location.Y + 1);
+                        e.Graphics.DrawString(voltText, font, Brushes.White, location);
+                    }
+                }
             }
         }
 
@@ -173,6 +197,7 @@ namespace BetterJoyForCemu {
                 // --- LÓGICA CLICK DERECHO (Emparejar o Forzar Gyro) ---
                 if (e.Button == MouseButtons.Right) {
                     if (!v.isPro && v.other == null) {
+                        v.UpdateVoltage();
                         // Si ya está en modo Vertical (por click izquierdo) o ya tiene el gyro forzado, buscamos pareja
                         if (v.isVerticalMode) {
                             bool succ = false;
@@ -215,7 +240,15 @@ namespace BetterJoyForCemu {
                 // --- LÓGICA CLICK IZQUIERDO (Toggle Modo / Separar) ---
                 if (e.Button == MouseButtons.Left) {
                     if (!v.isPro) {
+                        v.UpdateVoltage();
                         if (v.other != null) {
+
+                            // --- INICIO CAMBIO: Borrar de la memoria al separar manualmente ---
+                            string ignored;
+                            Program.mgr.joinedConnectionCache.TryRemove(v.serial_number, out ignored);
+                            Program.mgr.joinedConnectionCache.TryRemove(v.other.serial_number, out ignored);
+                            // --- FIN CAMBIO ---
+
                             // Separar mandos unidos
                             Joycon other = v.other;
                             ReenableViGEm(v);
