@@ -60,6 +60,8 @@ namespace BetterJoyForCemu {
             }
         }
         public bool active_gyro = false;
+        private long gyroToggleBtnTimestamp = -1; // Marca de tiempo de cuando se empezó a presionar
+        private bool gyroToggleHasFired = false;  // Evita que cambie 60 veces por segundo mientras mantienes presionado
 
         private long inactivity = Stopwatch.GetTimestamp();
 
@@ -81,13 +83,6 @@ namespace BetterJoyForCemu {
         private float velY_smoothed = 0f;
         private float angleX_fused = 0f; // Ángulo X (Yaw) acumulado
         private float angleY_fused = 0f; // Ángulo Y (Pitch) fusionado con acelerómetro
-        private float virtualStickX = 0f;
-        private float virtualStickY = 0f;
-
-        private float smoothStickX = 0f;
-        private float smoothStickY = 0f;
-
-        private float interpolationFactor = 0.3f;
 
         // Configuración del filtro (Ajustable)
         private float alpha = 0.05f;      // Suavizado del movimiento (0.01 - 0.10)
@@ -653,6 +648,7 @@ namespace BetterJoyForCemu {
 
         public void Detach(bool close = false) {
             stop_polling = true;
+            stop_output = true;
 
             this.BatteryVoltage = 0f; // Reset battery voltage
 
@@ -726,6 +722,7 @@ namespace BetterJoyForCemu {
                 // dt = 0.005f (5ms), pasamos eso para calcular la física.
                 ProcessGyroAccumulation(batchGyroZ, batchGyroY, 0.005f);
 
+                /*
                 // Enviamos a Xbox/DS4 UNA VEZ por paquete USB (cada 15ms)
                 // Esto elimina el tartamudeo (judder) provocado por enviar datos demasiado rápido al driver.
                 if (out_xbox != null) {
@@ -734,6 +731,7 @@ namespace BetterJoyForCemu {
                 if (out_ds4 != null) {
                     try { out_ds4.UpdateInput(MapToDualShock4Input(this)); } catch { }
                 }
+                */
 
                 if (ts_en == raw_buf[1] && !(isSnes || is64)) {
                     // ... logs originales ...
@@ -820,8 +818,6 @@ namespace BetterJoyForCemu {
             bool isGyroActive = (Config.Value("active_gyro") == "0" || active_gyro);
 
             if (extraGyroFeature.Substring(0, 3) != "joy" || !isGyroActive) {
-                // Centrar suavemente si se desactiva (opcional)
-                // virtualStickX = 0; virtualStickY = 0; 
                 return;
             }
 
@@ -830,7 +826,7 @@ namespace BetterJoyForCemu {
             float avgGyroY = 0f;
             int samples = gyroZ_samples.Length; // Deberían ser 3
 
-            for(int i = 0; i < samples; i++) {
+            for (int i = 0; i < samples; i++) {
                 avgGyroZ += gyroZ_samples[i];
                 avgGyroY += gyroY_samples[i];
             }
@@ -838,7 +834,6 @@ namespace BetterJoyForCemu {
             avgGyroY /= samples;
 
             // 2. Zona Muerta de Entrada (Evita el Drifting minúsculo)
-            // Si el movimiento es menor a 0.5 grados/segundo, ignóralo.
             if (Math.Abs(avgGyroZ) < 0.5f) avgGyroZ = 0f;
             if (Math.Abs(avgGyroY) < 0.5f) avgGyroY = 0f;
 
@@ -847,29 +842,16 @@ namespace BetterJoyForCemu {
             float sensY = Mappings.GetFloat("Gyro_Sensitivity_Y") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityY"]);
 
             // 4. FACTOR DE REDUCCIÓN DE SENSIBILIDAD (CRUCIAL)
-            // Como estamos mapeando Grados -> Joystick(0..1), necesitamos reducir drásticamente los valores.
-            // Multiplicamos por 0.0001f para que los valores de config (ej. 40.0) sean usables.
-            float reductionFactor = 0.0001f; 
+            float reductionFactor = 0.0001f;
 
             // 5. Acumular Posición (Integración)
-            // Yaw (Eje X) suele ser Z en el sensor. Pitch (Eje Y) suele ser Y.
-            // Invertimos signos según sea necesario.
-            virtualStickX += avgGyroZ * sensX * reductionFactor * (dt * samples * 1000); // Escalado por tiempo
-            virtualStickY += -(avgGyroY * sensY * reductionFactor * (dt * samples * 1000));
+            // Usamos variables temporales para calcular el destino
+            float tempX = targetStickX + (avgGyroZ * sensX * reductionFactor * (dt * samples * 1000));
+            float tempY = targetStickY - (avgGyroY * sensY * reductionFactor * (dt * samples * 1000));
 
-            // 6. Clamp (Límites del Joystick)
-            virtualStickX = Math.Max(-1.0f, Math.Min(1.0f, virtualStickX));
-            virtualStickY = Math.Max(-1.0f, Math.Min(1.0f, virtualStickY));
-
-            // 7. Interpolación de Salida (Smoothness)
-            // Esto hace que el movimiento sea "cremoso" en lugar de escalonado
-            smoothStickX += (virtualStickX - smoothStickX) * interpolationFactor;
-            smoothStickY += (virtualStickY - smoothStickY) * interpolationFactor;
-
-            // 8. Aplicar al Joystick Físico
-            float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
-            control_stick[0] = smoothStickX;
-            control_stick[1] = smoothStickY;
+            // 6. Clamp (Límites)
+            targetStickX = Math.Max(-1.0f, Math.Min(1.0f, tempX));
+            targetStickY = Math.Max(-1.0f, Math.Min(1.0f, tempY));
         }
 
         // For Joystick->Joystick inputs
@@ -902,88 +884,24 @@ namespace BetterJoyForCemu {
 
         byte[] sliderVal = new byte[] { 0, 0 };
 
-        private void ApplyGyroToJoystick(float dt) {
-            // Verificar activación
-            string extraGyroFeature = ConfigurationManager.AppSettings["GyroToJoyOrMouse"];
-            bool isGyroActive = (Config.Value("active_gyro") == "0" || active_gyro);
-            
-            if (extraGyroFeature.Substring(0, 3) != "joy" || !isGyroActive) {
-                // Reset suave cuando no se usa para que no salte al reactivar
-                velX_smoothed = 0f;
-                velY_smoothed = 0f;
-                return;
-            }
-
-            // --- LEER SENSORES ---
-            // Usamos datos CRUDOS (gyr_g) porque nosotros haremos la fusión manualmente
-            // Invertimos signos según sea necesario para tu orientación
-            float gyroSpeedX = gyr_g.Z; // Yaw (Giro horizontal)
-            float gyroSpeedY = gyr_g.Y; // Pitch (Giro vertical)
-            
-            // Sensibilidad base
-            float sensX = Mappings.GetFloat("Gyro_Sensitivity_X") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityX"]);
-            float sensY = Mappings.GetFloat("Gyro_Sensitivity_Y") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityY"]);
-
-            // --- FASE 1: CALCULAR ÁNGULO CON ACELERÓMETRO (Corrección de Gravedad) ---
-            // El acelerómetro sabe dónde está el suelo. Calculamos el ángulo Pitch absoluto.
-            // Atan2 devuelve radianes, convertimos a grados si es necesario, pero aquí trabajamos directo.
-            // Nota: Ajusta los ejes acc_g.Y / acc_g.Z según cómo sostengas el mando (plano vs vertical)
-            float accelPitch = (float)(Math.Atan2(acc_g.Y, acc_g.Z) * 180 / Math.PI); 
-
-            // --- FASE 2: FILTRO COMPLEMENTARIO (La Magia de Wii) ---
-            // Fórmula: Ángulo = 0.98 * (Ángulo + Gyro*dt) + 0.02 * (Acelerómetro)
-            // Esto usa el gyro para movimiento rápido y el acelerómetro para corregir drift lento.
-            
-            // EJE Y (Vertical) - Fusionado con gravedad
-            float gyroDeltaY = -(gyroSpeedY * dt * sensY); // Proyección de velocidad
-            angleY_fused = compFilter * (angleY_fused + gyroDeltaY) + (1f - compFilter) * (accelPitch * sensY * 0.05f); 
-            // Nota: El factor 0.05f en accelPitch es un "número mágico" para escalar los grados del acelerómetro al rango -1.0/1.0 del stick. 
-            // Ajusta si al inclinar el mando la mira se mueve demasiado o muy poco.
-
-            // EJE X (Horizontal) - Solo Gyro (No hay gravedad horizontal para corregir Yaw)
-            // Aquí seguimos usando acumulación simple pero suavizada, ya que el magnetómetro es complejo.
-            float gyroDeltaX = (gyroSpeedX * dt * sensX);
-            angleX_fused += gyroDeltaX;
-
-            // --- FASE 3: SUAVIZADO DE SALIDA (Para quitar "Saltos") ---
-            // Aplicamos un pequeño LERP a la salida final para "cremear" el movimiento a 60fps
-            virtualStickX = (virtualStickX * (1f - alpha)) + (angleX_fused * alpha);
-            virtualStickY = (virtualStickY * (1f - alpha)) + (angleY_fused * alpha);
-
-            // --- FASE 4: MAPPED Y CLAMP ---
-            // Mapeamos al joystick (-1 a 1)
-            float finalX = Math.Max(-1.0f, Math.Min(1.0f, virtualStickX));
-            float finalY = Math.Max(-1.0f, Math.Min(1.0f, virtualStickY));
-
-            // Corrección anti-drift simple para X (si lo sueltas en la mesa)
-            if (Math.Abs(gyroSpeedX) < 2.0f) { // Si el gyro apenas se mueve
-                // Opcional: Decaer lentamente la velocidad X o mantenerla fija
-            }
-
-            // Aplicar
-            float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
-            control_stick[0] = finalX;
-            control_stick[1] = finalY;
-        }
 
         private void DoThingsWithButtons() {
             int powerOffButton = (int)((isPro || !isLeft || other != null) ? Button.HOME : Button.CAPTURE);
 
             long timestamp = Stopwatch.GetTimestamp();
+            // --- Lógica de apagado por inactividad (Código original) ---
             if (HomeLongPowerOff && buttons[powerOffButton]) {
                 if ((timestamp - buttons_down_timestamp[powerOffButton]) / 10000 > 2000.0) {
-                    if (other != null)
-                        other.PowerOff();
-
+                    if (other != null) other.PowerOff();
                     PowerOff();
                     return;
                 }
             }
 
+            // --- Lógica de doble click para orientación (Código original) ---
             if (ChangeOrientationDoubleClick && buttons_down[(int)Button.STICK] && lastDoubleClick != -1 && !isPro) {
                 if ((buttons_down_timestamp[(int)Button.STICK] - lastDoubleClick) < 3000000) {
-                    form.conBtnClick(form.con[PadId], new MouseEventArgs(MouseButtons.Left, 1, 0, 0, 0)); // trigger connection button click
-
+                    form.conBtnClick(form.con[PadId], new MouseEventArgs(MouseButtons.Left, 1, 0, 0, 0));
                     lastDoubleClick = buttons_down_timestamp[(int)Button.STICK];
                     return;
                 }
@@ -994,9 +912,7 @@ namespace BetterJoyForCemu {
 
             if (PowerOffInactivityMins > 0) {
                 if ((timestamp - inactivity) / 10000 > PowerOffInactivityMins * 60 * 1000) {
-                    if (other != null)
-                        other.PowerOff();
-
+                    if (other != null) other.PowerOff();
                     PowerOff();
                     return;
                 }
@@ -1004,43 +920,32 @@ namespace BetterJoyForCemu {
 
             DetectShake();
 
-            if (buttons_down[(int)Button.CAPTURE])
-                Simulate(Config.Value("capture"));
-            if (buttons_down[(int)Button.HOME])
-                Simulate(Config.Value("home"));
+            if (buttons_down[(int)Button.CAPTURE]) Simulate(Config.Value("capture"));
+            if (buttons_down[(int)Button.HOME]) Simulate(Config.Value("home"));
             SimulateContinous((int)Button.CAPTURE, Config.Value("capture"));
             SimulateContinous((int)Button.HOME, Config.Value("home"));
 
+            // --- Lógica de botones SL/SR (Código original) ---
             if (isLeft) {
-                if (buttons_down[(int)Button.SL])
-                    Simulate(Config.Value("sl_l"), false, false);
-                if (buttons_up[(int)Button.SL])
-                    Simulate(Config.Value("sl_l"), false, true);
-                if (buttons_down[(int)Button.SR])
-                    Simulate(Config.Value("sr_l"), false, false);
-                if (buttons_up[(int)Button.SR])
-                    Simulate(Config.Value("sr_l"), false, true);
-
+                if (buttons_down[(int)Button.SL]) Simulate(Config.Value("sl_l"), false, false);
+                if (buttons_up[(int)Button.SL]) Simulate(Config.Value("sl_l"), false, true);
+                if (buttons_down[(int)Button.SR]) Simulate(Config.Value("sr_l"), false, false);
+                if (buttons_up[(int)Button.SR]) Simulate(Config.Value("sr_l"), false, true);
                 SimulateContinous((int)Button.SL, Config.Value("sl_l"));
                 SimulateContinous((int)Button.SR, Config.Value("sr_l"));
             } else {
-                if (buttons_down[(int)Button.SL])
-                    Simulate(Config.Value("sl_r"), false, false);
-                if (buttons_up[(int)Button.SL])
-                    Simulate(Config.Value("sl_r"), false, true);
-                if (buttons_down[(int)Button.SR])
-                    Simulate(Config.Value("sr_r"), false, false);
-                if (buttons_up[(int)Button.SR])
-                    Simulate(Config.Value("sr_r"), false, true);
-
+                if (buttons_down[(int)Button.SL]) Simulate(Config.Value("sl_r"), false, false);
+                if (buttons_up[(int)Button.SL]) Simulate(Config.Value("sl_r"), false, true);
+                if (buttons_down[(int)Button.SR]) Simulate(Config.Value("sr_r"), false, false);
+                if (buttons_up[(int)Button.SR]) Simulate(Config.Value("sr_r"), false, true);
                 SimulateContinous((int)Button.SL, Config.Value("sl_r"));
                 SimulateContinous((int)Button.SR, Config.Value("sr_r"));
             }
 
-            // Filtered IMU data
             this.cur_rotation = AHRS.GetEulerAngles();
-            float dt = 0.015f; // 15ms
+            float dt = 0.015f; 
 
+            // --- Lógica de Sliders Analógicos (Código original) ---
             if (GyroAnalogSliders && (other != null || isPro)) {
                 Button leftT = isLeft ? Button.SHOULDER_2 : Button.SHOULDER2_2;
                 Button rightT = isLeft ? Button.SHOULDER2_2 : Button.SHOULDER_2;
@@ -1068,56 +973,150 @@ namespace BetterJoyForCemu {
                 }
             }
 
+            // ==============================================================================
+            // === NUEVA LÓGICA DE ACTIVACIÓN DE GIROSCOPIO (2 SEGUNDOS HOLD + RESET) ===
+            // ==============================================================================
             string res_val = Config.Value("active_gyro");
             if (res_val.StartsWith("joy_")) {
                 int i = Int32.Parse(res_val.Substring(4));
-                if (buttons_down[i]) {
-                    virtualStickX = 0f;
-                    virtualStickY = 0f;
-                }
+                
+                bool isPressed = buttons[i] || (other != null && !SingleJoyConGyroVertical && other.buttons[i]);
 
-                if (GyroHoldToggle) {
-                    if (buttons_down[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_down[i]))
-                        active_gyro = true;
-                    else if (buttons_up[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_up[i]))
-                        active_gyro = false;
+                if (isPressed) {
+                    long currentTimestamp = Stopwatch.GetTimestamp();
+
+                    if (gyroToggleBtnTimestamp == -1) {
+                        gyroToggleBtnTimestamp = currentTimestamp;
+                        gyroToggleHasFired = false;
+                    }
+
+                    double elapsedMs = (currentTimestamp - gyroToggleBtnTimestamp) / 10000.0;
+
+                    // Si pasaron 2 segundos y no se ha disparado el evento
+                    if (elapsedMs >= 2000.0 && !gyroToggleHasFired) {
+                        active_gyro = !active_gyro; 
+                        gyroToggleHasFired = true; 
+
+                        // SI SE DESACTIVA: Reseteamos la posición a 0 inmediatamente
+                        if (!active_gyro) {
+                            targetStickX = 0f; targetStickY = 0f;
+                            currentStickX = 0f; currentStickY = 0f;
+                            
+                            // También reseteamos el stick físico para asegurar que no quede pegado
+                            stick[0] = 0f; stick[1] = 0f;
+                            if (isPro || other != null) { stick2[0] = 0f; stick2[1] = 0f; }
+                        }
+
+                        form.AppendTextBox("Gyro Switch: " + (active_gyro ? "ACTIVADO" : "DESACTIVADO") + "\r\n");
+                        
+                        if (active_gyro) SetRumble(160, 320, 0.6f); 
+                        else SetRumble(160, 160, 0.2f);
+                    }
                 } else {
-                    if (buttons_down[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_down[i]))
-                        active_gyro = !active_gyro;
+                    gyroToggleBtnTimestamp = -1;
+                    gyroToggleHasFired = false;
                 }
             }
 
+            // ==============================================================================
+            // === LÓGICA DE CENTRADO (MOUSE Y JOYSTICK) ===
+            // ==============================================================================
             if (extraGyroFeature == "mouse" && (isPro || (other == null) || (other != null && (Boolean.Parse(ConfigurationManager.AppSettings["GyroMouseLeftHanded"]) ? isLeft : !isLeft)))) {
-                // gyro data is in degrees/s
                 if (Config.Value("active_gyro") == "0" || active_gyro) {
                     int dx, dy;
-
                     if (UseFilteredIMU) {
-                        dx = (int)(GyroMouseSensitivityX * (cur_rotation[1] - cur_rotation[4])); // yaw
-                        dy = (int)-(GyroMouseSensitivityY * (cur_rotation[0] - cur_rotation[3])); // pitch
+                        dx = (int)(GyroMouseSensitivityX * (cur_rotation[1] - cur_rotation[4])); 
+                        dy = (int)-(GyroMouseSensitivityY * (cur_rotation[0] - cur_rotation[3])); 
                     } else {
                         dx = (int)(GyroMouseSensitivityX * (gyr_g.Z * dt));
                         dy = (int)-(GyroMouseSensitivityY * (gyr_g.Y * dt));
                     }
-                    
-                    // Apply Custom Config Sensitivity/Direction Multipliers
                     dx = (int)(dx * Mappings.GetFloat("Gyro_Sensitivity_X"));
                     dy = (int)(dy * Mappings.GetFloat("Gyro_Sensitivity_Y"));
-
                     WindowsInput.Simulate.Events().MoveBy(dx, dy).Invoke();
                 }
+            }
 
-                // reset mouse position to centre of primary monitor
-                res_val = Config.Value("reset_mouse");
-                if (res_val.StartsWith("joy_")) {
-                    int i = Int32.Parse(res_val.Substring(4));
-                    if (buttons_down[i] || (other != null && other.buttons_down[i]))
-                        WindowsInput.Simulate.Events().MoveTo(Screen.PrimaryScreen.Bounds.Width / 2, Screen.PrimaryScreen.Bounds.Height / 2).Invoke();
+            // Botón de Reset / Recentrar
+            res_val = Config.Value("reset_mouse");
+            if (res_val.StartsWith("joy_")) {
+                int i = Int32.Parse(res_val.Substring(4));
+                if (buttons_down[i] || (other != null && other.buttons_down[i])) {
+                    // 1. Resetear Mouse (Original)
+                    WindowsInput.Simulate.Events().MoveTo(Screen.PrimaryScreen.Bounds.Width / 2, Screen.PrimaryScreen.Bounds.Height / 2).Invoke();
+                    
+                    // 2. Resetear Joystick Interpolado (NUEVO)
+                    targetStickX = 0f;
+                    targetStickY = 0f;
+                    currentStickX = 0f;
+                    currentStickY = 0f;
+                    
+                    // 3. Resetear Joystick físico
+                    if (extraGyroFeature == "joy_left") { stick[0] = 0; stick[1] = 0; }
+                    else { stick2[0] = 0; stick2[1] = 0; }
                 }
             }
         }
 
         private Thread PollThreadObj;
+        private Thread OutputThreadObj;
+        private volatile bool stop_output = false;
+
+        // Variables para la interpolación del Gyro
+        private float targetStickX = 0f;
+        private float targetStickY = 0f;
+        private float currentStickX = 0f;
+        private float currentStickY = 0f;
+
+        // Factor de suavizado para 250Hz (4ms). 
+        // Un valor de 0.1f a 0.2f suele dar buena suavidad sin lag perceptible.
+        private float outputInterpolationFactor = 0.15f;
+        private void OutputLoop() {
+            // Intentamos correr a 250Hz aprox (cada 4ms)
+            int interval = 4;
+
+            while (!stop_output) {
+                if (state > state_.DROPPED) {
+
+                    // 1. INTERPOLACIÓN (La magia)
+                    // Movemos el stick actual un pequeño paso hacia el stick objetivo
+                    currentStickX += (targetStickX - currentStickX) * outputInterpolationFactor;
+                    currentStickY += (targetStickY - currentStickY) * outputInterpolationFactor;
+
+                    // 2. ACTUALIZAR SALIDA XBOX / DS4
+                    // Nota: MapToXbox360Input usa 'stick' y 'stick2'. 
+                    // Necesitamos asegurarnos de que MapToXbox360Input use nuestros valores interpolados
+                    // para el stick que tenga el gyro asignado.
+
+                    // Un pequeño hack temporal: Sobrescribimos el stick físico con el interpolado 
+                    // justo antes de mapear, si el gyro está activo.
+                    if (Config.Value("active_gyro") == "0" || active_gyro) {
+                        string extraGyroFeature = ConfigurationManager.AppSettings["GyroToJoyOrMouse"];
+                        if (extraGyroFeature.StartsWith("joy")) {
+                            float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
+
+                            // Guardamos el valor original por si acaso (opcional)
+                            // float oldX = control_stick[0]; float oldY = control_stick[1];
+
+                            // Aplicamos el valor interpolado suave
+                            control_stick[0] = Math.Max(-1.0f, Math.Min(1.0f, currentStickX));
+                            control_stick[1] = Math.Max(-1.0f, Math.Min(1.0f, currentStickY));
+                        }
+                    }
+
+                    // Enviar al driver virtual
+                    if (out_xbox != null) {
+                        try { out_xbox.UpdateInput(MapToXbox360Input(this)); } catch { }
+                    }
+                    if (out_ds4 != null) {
+                        try { out_ds4.UpdateInput(MapToDualShock4Input(this)); } catch { }
+                    }
+                }
+
+                Thread.Sleep(interval);
+            }
+        }
+
         private void Poll() {
             stop_polling = false;
             int attempts = 0;
@@ -1350,7 +1349,13 @@ namespace BetterJoyForCemu {
                 PollThreadObj.IsBackground = true;
                 PollThreadObj.Start();
 
-                form.AppendTextBox("Starting poll thread.\r\n");
+                stop_output = false;
+                OutputThreadObj = new Thread(new ThreadStart(OutputLoop));
+                OutputThreadObj.IsBackground = true;
+                OutputThreadObj.Priority = ThreadPriority.AboveNormal; // Importante para suavidad
+                OutputThreadObj.Start();
+
+                form.AppendTextBox("Starting poll and output threads.\r\n");
             } else {
                 form.AppendTextBox("Poll cannot start.\r\n");
             }
