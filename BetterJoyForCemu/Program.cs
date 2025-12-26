@@ -19,6 +19,8 @@ using BetterJoyForCemu.Collections;
 using Nefarius.ViGEm.Client;
 using static BetterJoyForCemu._3rdPartyControllers;
 using static BetterJoyForCemu.HIDapi;
+using System.Threading.Tasks;
+
 
 namespace BetterJoyForCemu {
     public class JoyconManager {
@@ -31,8 +33,18 @@ namespace BetterJoyForCemu {
         private const ushort product_pro = 0x2009;
         private const ushort product_snes = 0x2017;
         private const ushort product_n64 = 0x2019;
+        
 
         public ConcurrentDictionary<string, string> joinedConnectionCache = new ConcurrentDictionary<string, string>();
+
+        // --- NUEVO: Estructura para guardar estado al desconectar ---
+        public struct ControllerState {
+            public bool isVertical;
+            public bool forceGyroVertical;
+            public int previousPadId;
+        }
+        public ConcurrentDictionary<string, ControllerState> disconnectedStates = new ConcurrentDictionary<string, ControllerState>();
+        // -----------------------------------------------------------
 
         public ConcurrentList<Joycon> j { get; private set; } // Array of all connected Joy-Cons
         static JoyconManager instance;
@@ -64,11 +76,20 @@ namespace BetterJoyForCemu {
             return false;
         }
 
-        void CleanUp() { // removes dropped controllers from list
+        void CleanUp() { 
             List<Joycon> rem = new List<Joycon>();
             foreach (Joycon joycon in j) {
                 if (joycon.state == Joycon.state_.DROPPED) {
-                    // --- INICIO CAMBIO: Guardar en memoria antes de separar ---
+                    
+                    // --- NUEVO: Guardar estado antes de eliminar ---
+                    ControllerState state = new ControllerState {
+                        isVertical = joycon.isVerticalMode,
+                        forceGyroVertical = joycon.forceGyroVertical,
+                        previousPadId = joycon.PadId
+                    };
+                    disconnectedStates[joycon.serial_number] = state;
+                    // ---------------------------------------------
+
                     if (joycon.other != null) {
                         string mySerial = joycon.serial_number;
                         string otherSerial = joycon.other.serial_number;
@@ -82,10 +103,10 @@ namespace BetterJoyForCemu {
 
                     joycon.Detach(true);
                     rem.Add(joycon);
-
+                    
                     foreach (Button b in form.con) {
                         if (b.Enabled & b.Tag == joycon) {
-                            b.Invoke(new MethodInvoker(delegate {
+                             b.Invoke(new MethodInvoker(delegate {
                                 b.BackColor = System.Drawing.Color.FromArgb(0x00, System.Drawing.SystemColors.Control);
                                 b.Enabled = false;
                                 b.BackgroundImage = Properties.Resources.cross;
@@ -93,11 +114,9 @@ namespace BetterJoyForCemu {
                             break;
                         }
                     }
-
                     form.AppendTextBox("Removed dropped controller. Can be reconnected.\r\n");
                 }
             }
-
             foreach (Joycon v in rem)
                 j.Remove(v);
         }
@@ -214,15 +233,29 @@ namespace BetterJoyForCemu {
                     j.Add(new Joycon(handle, EnableIMU, EnableLocalize & EnableIMU, 0.05f, isLeft, enumerate.path, enumerate.serial_number, j.Count, isPro, isSnes, is64,thirdParty != null));
 
                     foundNew = true;
-                    Joycon newJoy = j.Last(); // Referencia al nuevo joycon
+                    Joycon newJoy = j.Last(); 
                     newJoy.form = form;
 
-                    // --- INICIO CAMBIO: Lógica de Auto-Rejoin ---
+                    // --- NUEVO: Restauración de Estado y Reconexión Robusta ---
+                    if (disconnectedStates.ContainsKey(newJoy.serial_number)) {
+                        ControllerState oldState = disconnectedStates[newJoy.serial_number];
+                        
+                        // 1. Restaurar Orientación
+                        newJoy.isVerticalMode = oldState.isVertical;
+                        newJoy.forceGyroVertical = oldState.forceGyroVertical;
+                        
+                        // 2. Intentar recuperar ID (PadId es difícil de forzar si la lista cambia, pero ayuda loguearlo)
+                        // Para DSU es crítico que los datos fluyan, el ID se reasigna por orden de lista.
+                        
+                        form.AppendTextBox($"Controller {newJoy.serial_number} reconnected. Restoring state: Vertical={oldState.isVertical}\r\n");
+                    }
+                    // ----------------------------------------------------------
+
                     if (!newJoy.isPro && joinedConnectionCache.ContainsKey(newJoy.serial_number)) {
                         string targetSerial = joinedConnectionCache[newJoy.serial_number];
                         Joycon partner = null;
 
-                        // Buscar si la pareja ya está conectada
+                        // Buscar si la pareja ya está conectada en la lista activa
                         foreach (var c in j) {
                             if (c.serial_number == targetSerial && c != newJoy && c.state > Joycon.state_.DROPPED) {
                                 partner = c;
@@ -241,12 +274,13 @@ namespace BetterJoyForCemu {
                             newJoy.forceGyroVertical = false;
                             partner.forceGyroVertical = false;
 
-                            // Desconectar el controlador virtual del derecho (slave logic)
+                            // Desconectar el controlador virtual del derecho (lógica de esclavo)
+                            // Esto evita que se reporte doble entrada o entrada incorrecta al DSU
                             Joycon rightJoy = newJoy.isLeft ? partner : newJoy;
                             if (rightJoy.out_xbox != null) { rightJoy.out_xbox.Disconnect(); rightJoy.out_xbox = null; }
                             if (rightJoy.out_ds4 != null) { rightJoy.out_ds4.Disconnect(); rightJoy.out_ds4 = null; }
 
-                            // Actualizar Iconos en UI
+                            // Actualizar Iconos en la Interfaz Gráfica (UI)
                             form.Invoke(new MethodInvoker(delegate {
                                 foreach (Button b in form.con) {
                                     if (b.Tag == newJoy) b.BackgroundImage = newJoy.isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
@@ -256,7 +290,6 @@ namespace BetterJoyForCemu {
                             }));
                         }
                     }
-                    // --- FIN CAMBIO ---
 
                     if (j.Count < 5) {
                         int ii = -1;
@@ -264,19 +297,19 @@ namespace BetterJoyForCemu {
                             ii++;
                             if (!v.Enabled) {
                                 System.Drawing.Bitmap temp;
-                                switch (prod_id) {
-                                    case (product_l):
-                                        temp = Properties.Resources.jc_left_s; break;
-                                    case (product_r):
-                                        temp = Properties.Resources.jc_right_s; break;
-                                    case (product_pro):
-                                        temp = Properties.Resources.pro; break;
-                                    case (product_snes):
-                                        temp = Properties.Resources.snes; break;
-                                    case (product_n64):
-                                        temp = Properties.Resources.ultra; break;
-                                    default:
-                                        temp = Properties.Resources.cross; break;
+                                // Hack para asegurar que el icono refleje el modo vertical restaurado
+                                if (newJoy.isVerticalMode) {
+                                    temp = isLeft ? Properties.Resources.jc_left : Properties.Resources.jc_right;
+                                } else {
+                                     // Lógica por defecto (normalmente horizontal si no son pareja)
+                                     switch (prod_id) {
+                                        case (product_l): temp = Properties.Resources.jc_left_s; break;
+                                        case (product_r): temp = Properties.Resources.jc_right_s; break;
+                                        case (product_pro): temp = Properties.Resources.pro; break;
+                                        case (product_snes): temp = Properties.Resources.snes; break;
+                                        case (product_n64): temp = Properties.Resources.ultra; break;
+                                        default: temp = Properties.Resources.cross; break;
+                                    }
                                 }
 
                                 v.Invoke(new MethodInvoker(delegate {
@@ -332,10 +365,15 @@ namespace BetterJoyForCemu {
 
                     jc.SetHomeLight(on);
 
+                    // --- CRÍTICO: Asegurar que el reporte de datos inicie correctamente ---
                     jc.Begin();
+                    
                     if (form.allowCalibration) {
                         jc.getActiveData();
                     }
+                    // Forzar actualización de LED y Rumble para despertar el hilo de input si estaba dormido
+                    jc.SetPlayerLEDByPadID(); 
+                    // ---------------------------------------------------------------------
                 }
             }
         }
@@ -380,57 +418,58 @@ namespace BetterJoyForCemu {
 
         private static WindowsInput.Events.Sources.IKeyboardEventSource keyboard;
         private static WindowsInput.Events.Sources.IMouseEventSource mouse;
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        static extern uint RegisterWindowMessage(string lpString);
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        const int HWND_BROADCAST = 0xFFFF;
 
         public static void Start() {
-            pid = Process.GetCurrentProcess().Id.ToString(); // get current process id for HidCerberus.Srv
+            pid = Process.GetCurrentProcess().Id.ToString();
 
-            if (useHIDG) {
-                form.console.AppendText("HidGuardian is enabled.\r\n");
-                try {
-                    var HidCerberusService = new ServiceController("HidCerberus Service");
-                    if (HidCerberusService.Status == ServiceControllerStatus.Stopped) {
-                        form.console.AppendText("HidGuardian was stopped. Starting...\r\n");
-
-                        try {
-                            HidCerberusService.Start();
-                        } catch (Exception e) {
-                            form.console.AppendText("Unable to start HidGuardian - everything should work fine without it, but if you need it, run the app again as an admin.\r\n");
-                            useHIDG = false;
-                        }
-                    }
-                } catch (Exception e) {
-                    form.console.AppendText("Unable to start HidGuardian - everything should work fine without it, but if you need it, install it properly as admin.\r\n");
-                    useHIDG = false;
-                }
-
-                HttpWebResponse response;
-                if (Boolean.Parse(ConfigurationManager.AppSettings["PurgeWhitelist"])) {
+            // MOVIDO A UN HILO APARTE: Esto es lo que causaba que la app tardara en abrir
+            Task.Run(() => {
+                if (useHIDG) {
+                    // Nota: Usamos form.AppendTextBox porque es thread-safe, form.console.AppendText crashearía aquí
+                    form.AppendTextBox("HidGuardian is enabled.\r\n");
                     try {
-                        response = (HttpWebResponse)WebRequest.Create(@"http://localhost:26762/api/v1/hidguardian/whitelist/purge/").GetResponse(); // remove all programs allowed to see controller
+                        var HidCerberusService = new ServiceController("HidCerberus Service");
+                        if (HidCerberusService.Status == ServiceControllerStatus.Stopped) {
+                            form.AppendTextBox("HidGuardian was stopped. Starting...\r\n");
+                            try {
+                                HidCerberusService.Start();
+                            } catch (Exception e) {
+                                form.AppendTextBox("Unable to start HidGuardian.\r\n");
+                                useHIDG = false;
+                            }
+                        }
                     } catch (Exception e) {
-                        form.console.AppendText("Unable to purge whitelist.\r\n");
+                        form.AppendTextBox("Unable to start HidGuardian service access.\r\n");
                         useHIDG = false;
                     }
-                }
 
-                try {
-                    response = (HttpWebResponse)WebRequest.Create(@"http://localhost:26762/api/v1/hidguardian/whitelist/add/" + pid).GetResponse(); // add BetterJoyForCemu to allowed processes 
-                } catch (Exception e) {
-                    form.console.AppendText("Unable to add program to whitelist.\r\n");
-                    useHIDG = false;
+                    if (useHIDG) { // Solo si no falló lo anterior
+                        try {
+                            if (Boolean.Parse(ConfigurationManager.AppSettings["PurgeWhitelist"])) {
+                                WebRequest.Create(@"http://localhost:26762/api/v1/hidguardian/whitelist/purge/").GetResponse();
+                            }
+                            WebRequest.Create(@"http://localhost:26762/api/v1/hidguardian/whitelist/add/" + pid).GetResponse();
+                        } catch (Exception e) {
+                            form.AppendTextBox("Unable to configure HidGuardian whitelist.\r\n");
+                        }
+                    }
                 }
-            }
+            });
 
             if (Boolean.Parse(ConfigurationManager.AppSettings["ShowAsXInput"]) || Boolean.Parse(ConfigurationManager.AppSettings["ShowAsDS4"])) {
                 try {
-                    emClient = new ViGEmClient(); // Manages emulated XInput
+                    emClient = new ViGEmClient(); 
                 } catch (Nefarius.ViGEm.Client.Exceptions.VigemBusNotFoundException) {
-                    form.console.AppendText("Could not start VigemBus. Make sure drivers are installed correctly.\r\n");
+                    form.AppendTextBox("Could not start VigemBus. Make sure drivers are installed correctly.\r\n");
                 }
             }
 
             foreach (NetworkInterface nic in NetworkInterface.GetAllNetworkInterfaces()) {
-                // Get local BT host MAC
                 if (nic.NetworkInterfaceType != NetworkInterfaceType.FastEthernetFx && nic.NetworkInterfaceType != NetworkInterfaceType.Wireless80211) {
                     if (nic.Name.Split()[0] == "Bluetooth") {
                         btMAC = nic.GetPhysicalAddress();
@@ -438,7 +477,6 @@ namespace BetterJoyForCemu {
                 }
             }
 
-            // a bit hacky
             _3rdPartyControllers partyForm = new _3rdPartyControllers();
             partyForm.CopyCustomControllers();
 
@@ -453,13 +491,12 @@ namespace BetterJoyForCemu {
 
             server.Start(IPAddress.Parse(ConfigurationManager.AppSettings["IP"]), Int32.Parse(ConfigurationManager.AppSettings["Port"]));
 
-            // Capture keyboard + mouse events for binding's sake
             keyboard = WindowsInput.Capture.Global.KeyboardAsync();
             keyboard.KeyEvent += Keyboard_KeyEvent;
             mouse = WindowsInput.Capture.Global.MouseAsync();
             mouse.MouseEvent += Mouse_MouseEvent;
 
-            form.console.AppendText("All systems go\r\n");
+            form.AppendTextBox("All systems go\r\n");
         }
 
         private static void Mouse_MouseEvent(object sender, WindowsInput.Events.Sources.EventSourceEventArgs<WindowsInput.Events.Sources.MouseEvent> e) {
@@ -530,16 +567,18 @@ namespace BetterJoyForCemu {
 
         private static string appGuid = "1bf709e9-c133-41df-933a-c9ff3f664c7b"; // randomly-generated
         static void Main(string[] args) {
-
-            // Setting the culturesettings so float gets parsed correctly
             CultureInfo.CurrentCulture = new CultureInfo("en-US", false);
-
-            // Set the correct DLL for the current OS
             SetupDlls();
+
+            CalibrationManager.Load();
+
+            // Registramos un mensaje único para comunicarnos entre instancias
+            int WM_SHOWME = (int)RegisterWindowMessage("BetterJoy_Show");
 
             using (Mutex mutex = new Mutex(false, "Global\\" + appGuid)) {
                 if (!mutex.WaitOne(0, false)) {
-                    MessageBox.Show("Instance already running.", "BetterJoy");
+                    // Si ya existe, enviamos un mensaje a todas las ventanas para que la nuestra se despierte
+                    PostMessage((IntPtr)HWND_BROADCAST, (uint)WM_SHOWME, IntPtr.Zero, IntPtr.Zero);
                     return;
                 }
 

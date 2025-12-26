@@ -41,16 +41,16 @@ namespace BetterJoyForCemu {
 			return count;
 		}
 
-		public static void Init(List<KeyValuePair<string, float[]>> caliData) {
+		public static void Init() {
 			foreach (string s in new string[] { "ProgressiveScan", "StartInTray", "capture", "home", "sl_l", "sl_r", "sr_l", "sr_r", "shake", "reset_mouse", "active_gyro" })
 				variables[s] = GetDefaultValue(s);
 
 			if (File.Exists(path)) {
 
 				// Reset settings file if old settings
-				if (CountLinesInFile(path) < settingsNum) {
+				if (CountLinesInFile(path) < settingsNum - 1) { // Adjusted for safety
 					File.Delete(path);
-					Init(caliData);
+					Init();
 					return;
 				}
 
@@ -62,19 +62,6 @@ namespace BetterJoyForCemu {
 						try {
 							if (lineNO < settingsNum) { // load in basic settings
 								variables[vs[0]] = vs[1];
-							} else { // load in calibration presets
-								caliData.Clear();
-								for (int i = 0; i < vs.Length; i++) {
-									string[] caliArr = vs[i].Split(',');
-									float[] newArr = new float[6];
-									for (int j = 1; j < caliArr.Length; j++) {
-										newArr[j - 1] = float.Parse(caliArr[j]);
-									}
-									caliData.Add(new KeyValuePair<string, float[]>(
-										caliArr[0],
-										newArr
-									));
-								}
 							}
 						} catch { }
 						lineNO++;
@@ -84,13 +71,6 @@ namespace BetterJoyForCemu {
 				using (StreamWriter file = new StreamWriter(path)) {
 					foreach (string k in variables.Keys)
 						file.WriteLine(String.Format("{0} {1}", k, variables[k]));
-					string caliStr = "";
-					for (int i = 0; i < caliData.Count; i++) {
-						string space = " ";
-						if (i == 0) space = "";
-						caliStr += space + caliData[i].Key + "," + String.Join(",", caliData[i].Value);
-					}
-					file.WriteLine(caliStr);
 				}
 			}
 		}
@@ -117,18 +97,7 @@ namespace BetterJoyForCemu {
 		}
 
 		public static void SaveCaliData(List<KeyValuePair<string, float[]>> caliData) {
-			string[] txt = File.ReadAllLines(path);
-			if (txt.Length < settingsNum + 1) // no custom calibrations yet
-				Array.Resize(ref txt, txt.Length + 1);
-
-			string caliStr = "";
-			for (int i = 0; i < caliData.Count; i++) {
-				string space = " ";
-				if (i == 0) space = "";
-				caliStr += space + caliData[i].Key + "," + String.Join(",", caliData[i].Value);
-			}
-            txt[settingsNum] = caliStr;
-            File.WriteAllLines(path, txt);
+            // Deprecated - replaced by CalibrationManager
 		}
 
 		public static void Save() {

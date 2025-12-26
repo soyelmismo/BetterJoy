@@ -12,19 +12,33 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Xml.Linq;
+using System.Runtime.InteropServices;
 
 namespace BetterJoyForCemu {
     public partial class MainForm : Form {
         public bool allowCalibration = Boolean.Parse(ConfigurationManager.AppSettings["AllowCalibration"]);
         public List<Button> con, loc;
         public bool calibrate;
-        public List<KeyValuePair<string, float[]>> caliData;
         private Timer countDown;
         private int count;
-        public List<int> xG, yG, zG, xA, yA, zA;
         public bool shakeInputEnabled = Boolean.Parse(ConfigurationManager.AppSettings["EnableShakeInput"]);
         public float shakeSesitivity = float.Parse(ConfigurationManager.AppSettings["ShakeInputSensitivity"]);
         public float shakeDelay = float.Parse(ConfigurationManager.AppSettings["ShakeInputDelay"]);
+        public Joycon selectedJoycon = null;
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)] 
+        static extern uint RegisterWindowMessage(string lpString);
+        [DllImport("user32.dll")]
+        public static extern bool ChangeWindowMessageFilter(uint msg, uint dwFlag);
+        private const uint MSGFLT_ADD = 1;
+        private int WM_SHOWME;
+
+
+        protected override void WndProc(ref Message m) {
+            if (m.Msg == WM_SHOWME) {
+                ShowFromTray();
+            }
+            base.WndProc(ref m);
+        }
 
         public enum NonOriginalController : int {
             Disabled = 0,
@@ -33,11 +47,8 @@ namespace BetterJoyForCemu {
         }
 
         public MainForm() {
-            xG = new List<int>(); yG = new List<int>(); zG = new List<int>();
-            xA = new List<int>(); yA = new List<int>(); zA = new List<int>();
-            caliData = new List<KeyValuePair<string, float[]>> {
-                new KeyValuePair<string, float[]>("0", new float[6] {0,0,0,-710,0,0})
-            };
+            WM_SHOWME = (int)RegisterWindowMessage("BetterJoy_Show");
+            ChangeWindowMessageFilter((uint)WM_SHOWME, MSGFLT_ADD);
 
             InitializeComponent();
 
@@ -121,7 +132,7 @@ namespace BetterJoyForCemu {
 
         private void MainForm_Load(object sender, EventArgs e) {
             Mappings.form = this;
-            Config.Init(caliData);
+            Config.Init();
             Mappings.Load();
 
             Program.Start();
@@ -279,6 +290,26 @@ namespace BetterJoyForCemu {
                         Mappings.Load();
                     }
                 }
+                if (e.Button == MouseButtons.Middle) {
+                    // Verificar si la calibración está habilitada en config
+                    if (!allowCalibration) {
+                        AppendTextBox("Calibration disabled in settings.\r\n");
+                        return;
+                    }
+
+                    // Verificar si ya se está calibrando algo
+                    if (this.calibrate || (countDown != null && countDown.Enabled)) {
+                        AppendTextBox("Calibration already in progress.\r\n");
+                        return;
+                    }
+
+                    // Seleccionar este mando específico
+                    selectedJoycon = v;
+                    AppendTextBox($"Starting calibration for JoyCon {v.PadId + 1} via middle-click...\r\n");
+
+                    // Iniciar proceso (usando el método que creamos en la respuesta anterior)
+                    RunCalibration();
+                }
             }
         }
 
@@ -372,30 +403,74 @@ namespace BetterJoyForCemu {
         }
         private void StartCalibrate(object sender, EventArgs e) {
             if (Program.mgr.j.Count == 0) {
-                this.console.Text = "Please connect a single pro controller.";
+                this.console.Text = "Please connect a controller.";
                 return;
             }
-            if (Program.mgr.j.Count > 1) {
-                this.console.Text = "Please calibrate one controller at a time (disconnect others).";
-                return;
+
+            // Crea el menú contextual
+            ContextMenuStrip cm = new ContextMenuStrip();
+
+            // OPCIÓN 1: Calibrar Todos
+            cm.Items.Add("All Connected Controllers", null, (s, ev) => {
+                selectedJoycon = null; // null indicará "Modo Todos"
+                RunCalibration();
+            });
+
+            // Separador visual
+            cm.Items.Add(new ToolStripSeparator());
+
+            // OPCIÓN 2: Calibrar Individuales
+            foreach (Joycon j in Program.mgr.j) {
+                string name = String.Format("Joycon {0} ({1})", j.PadId + 1, j.isPro ? "Pro" : "Joy");
+                cm.Items.Add(name, null, (s, ev) => {
+                    selectedJoycon = j; // Asignamos el mando específico
+                    RunCalibration();
+                });
             }
+
+            // Mostrar el menú debajo del botón
+            cm.Show(AutoCalibrate, new Point(0, AutoCalibrate.Height));
+        }
+
+        private void RunCalibration() {
             this.AutoCalibrate.Enabled = false;
             countDown = new Timer();
-            this.count = 4;
-            this.CountDown(null, null);
+            // INICIO CAMBIO: Reducir el tiempo de cuenta regresiva a 1 segundo
+            this.count = 1; 
+            // FIN CAMBIO
+            this.CountDown(null, null); // Llama inmediatamente para mostrar el mensaje
             countDown.Tick += new EventHandler(CountDown);
             countDown.Interval = 1000;
             countDown.Enabled = true;
         }
 
+
+
         private void StartGetData() {
-            this.xG.Clear(); this.yG.Clear(); this.zG.Clear();
-            this.xA.Clear(); this.yA.Clear(); this.zA.Clear();
+            // 1. Determinar qué calibrar
+            List<Joycon> targets = new List<Joycon>();
+
+            if (selectedJoycon != null) {
+                targets.Add(selectedJoycon);
+            } else {
+                // Si es null, añadimos TODOS
+                targets.AddRange(Program.mgr.j);
+            }
+
+            // 2. Iniciar calibración concurrente (Async lógicamente)
+            // Cada Joycon empezará a llenar su buffer en su propio ciclo de polling USB
+            foreach (var j in targets) {
+                j.BeginCalibration();
+            }
+
+            this.console.Text += $"Collecting data for {targets.Count} controller(s)...\r\n";
+
+            // 3. Iniciar temporizador de espera (1 segundo)
             countDown = new Timer();
-            this.count = 3;
+            this.count = 3; // Usamos 0 para que el próximo tick sea el final
             this.calibrate = true;
             countDown.Tick += new EventHandler(CalcData);
-            countDown.Interval = 1000;
+            countDown.Interval = 1000; // Esperar 1 segundo acumulando datos
             countDown.Enabled = true;
         }
 
@@ -405,89 +480,73 @@ namespace BetterJoyForCemu {
         }
 
         private void CountDown(object sender, EventArgs e) {
+            // Este método ahora se llama una vez, y el siguiente tick (si ocurriera) 
+            // ya no ejecutaría el contenido del if (this.count == 0) porque lo detendríamos.
+            
+            // INICIO CAMBIO: Detener el timer después de la primera ejecución
             if (this.count == 0) {
                 this.console.Text = "Calibrating...";
                 countDown.Stop();
+                countDown.Dispose(); // Liberar recursos del timer
                 this.StartGetData();
             } else {
+                // Mensaje inicial (solo se muestra si count > 0)
                 this.console.Text = "Plese keep the controller flat." + "\r\n";
-                this.console.Text += "Calibration will start in " + this.count + " seconds.";
+                this.console.Text += "Calibration will start in " + this.count + " second."; // Cambiado a 'second' para 1s
                 this.count--;
+                // Si el count llegó a 0 justo ahora, la próxima vez (en el tick de arriba) 
+                // ejecutará el if(this.count == 0).
             }
         }
+
         private void CalcData(object sender, EventArgs e) {
             if (this.count == 0) {
+                // Detener timer
                 countDown.Stop();
+                countDown.Dispose();
                 this.calibrate = false;
-                string serNum = Program.mgr.j.First().serial_number;
-                int serIndex = this.findSer(serNum);
-                float[] Arr = new float[6] { 0, 0, 0, 0, 0, 0 };
-                if (serIndex == -1) {
-                    this.caliData.Add(new KeyValuePair<string, float[]>(
-                         serNum,
-                         Arr
-                    ));
-                } else {
-                    Arr = this.caliData[serIndex].Value;
+
+                // Determinar objetivos nuevamente
+                List<Joycon> targets = new List<Joycon>();
+                if (selectedJoycon != null) targets.Add(selectedJoycon);
+                else targets.AddRange(Program.mgr.j);
+
+                if (targets.Count == 0) {
+                    this.AutoCalibrate.Enabled = true;
+                    return;
                 }
-                Random rnd = new Random();
-                Arr[0] = (float)quickselect_median(this.xG, rnd.Next);
-                Arr[1] = (float)quickselect_median(this.yG, rnd.Next);
-                Arr[2] = (float)quickselect_median(this.zG, rnd.Next);
-                Arr[3] = (float)quickselect_median(this.xA, rnd.Next);
-                Arr[4] = (float)quickselect_median(this.yA, rnd.Next);
-                Arr[5] = (float)quickselect_median(this.zA, rnd.Next) - 4010; //Joycon.cs acc_sen 16384
-                this.console.Text += "Calibration completed!!!" + "\r\n";
-                Config.SaveCaliData(this.caliData);
-                Program.mgr.j.First().getActiveData();
+
+                int successCount = 0;
+
+                // Procesar resultados
+                foreach (var j in targets) {
+                    // Obtener resultado procesado internamente por el Joycon
+                    // Esto detiene el flag IsCalibrating internamente
+                    float[] result = j.EndCalibrationAndGetMedian();
+
+                    if (result != null) {
+                        // 1. Guardar en disco (Persistencia)
+                        CalibrationManager.UpdateCalibration(j.serial_number, result);
+
+                        // 2. Aplicar en memoria (Hot reload)
+                        j.active_calibration_data = result;
+
+                        successCount++;
+                        this.console.Text += $"Saved calibration for {j.serial_number}\r\n";
+                    } else {
+                        this.console.Text += $"Failed to calibrate {j.serial_number} (No data)\r\n";
+                    }
+                }
+
+                if (successCount > 0)
+                    this.console.Text += "Concurrent calibration finished.\r\n";
+
                 this.AutoCalibrate.Enabled = true;
+                this.selectedJoycon = null;
             } else {
+                this.console.Text += ".";
                 this.count--;
             }
-
-        }
-        private double quickselect_median(List<int> l, Func<int, int> pivot_fn) {
-            int ll = l.Count;
-            if (ll % 2 == 1) {
-                return this.quickselect(l, ll / 2, pivot_fn);
-            } else {
-                return 0.5 * (quickselect(l, ll / 2 - 1, pivot_fn) + quickselect(l, ll / 2, pivot_fn));
-            }
-        }
-
-        private int quickselect(List<int> l, int k, Func<int, int> pivot_fn) {
-            if (l.Count == 1 && k == 0) {
-                return l[0];
-            }
-            int pivot = l[pivot_fn(l.Count)];
-            List<int> lows = l.Where(x => x < pivot).ToList();
-            List<int> highs = l.Where(x => x > pivot).ToList();
-            List<int> pivots = l.Where(x => x == pivot).ToList();
-            if (k < lows.Count) {
-                return quickselect(lows, k, pivot_fn);
-            } else if (k < (lows.Count + pivots.Count)) {
-                return pivots[0];
-            } else {
-                return quickselect(highs, k - lows.Count - pivots.Count, pivot_fn);
-            }
-        }
-
-        public float[] activeCaliData(string serNum) {
-            for (int i = 0; i < this.caliData.Count; i++) {
-                if (this.caliData[i].Key == serNum) {
-                    return this.caliData[i].Value;
-                }
-            }
-            return this.caliData[0].Value;
-        }
-
-        private int findSer(string serNum) {
-            for (int i = 0; i < this.caliData.Count; i++) {
-                if (this.caliData[i].Key == serNum) {
-                    return i;
-                }
-            }
-            return -1;
         }
     }
 }

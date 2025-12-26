@@ -77,6 +77,22 @@ namespace BetterJoyForCemu {
         public DebugType debug_type = (DebugType)int.Parse(ConfigurationManager.AppSettings["DebugType"]);
         //public DebugType debug_type = DebugType.NONE; //Keep this for manual debugging during development.
         public bool isLeft;
+        private float velX_smoothed = 0f;
+        private float velY_smoothed = 0f;
+        private float angleX_fused = 0f; // Ángulo X (Yaw) acumulado
+        private float angleY_fused = 0f; // Ángulo Y (Pitch) fusionado con acelerómetro
+        private float virtualStickX = 0f;
+        private float virtualStickY = 0f;
+
+        private float smoothStickX = 0f;
+        private float smoothStickY = 0f;
+
+        private float interpolationFactor = 0.3f;
+
+        // Configuración del filtro (Ajustable)
+        private float alpha = 0.05f;      // Suavizado del movimiento (0.01 - 0.10)
+        private float compFilter = 0.90f; // Cuánto confiamos en el Gyro vs Acelerómetro (0.95 - 0.99)  
+
         public enum state_ : uint {
             NOT_ATTACHED,
             DROPPED,
@@ -282,6 +298,40 @@ namespace BetterJoyForCemu {
 
         public MainForm form;
 
+        public bool IsCalibrating { get; private set; } = false;
+        private List<short> _calBufGx = new List<short>();
+        private List<short> _calBufGy = new List<short>();
+        private List<short> _calBufGz = new List<short>();
+        private List<short> _calBufAx = new List<short>();
+        private List<short> _calBufAy = new List<short>();
+        private List<short> _calBufAz = new List<short>();
+
+        public void BeginCalibration() {
+            _calBufGx.Clear(); _calBufGy.Clear(); _calBufGz.Clear();
+            _calBufAx.Clear(); _calBufAy.Clear(); _calBufAz.Clear();
+            IsCalibrating = true;
+        }
+
+        public float[] EndCalibrationAndGetMedian() {
+            IsCalibrating = false;
+
+            if (_calBufGx.Count < 10) return null;
+
+            float[] res = new float[6];
+
+            res[0] = _calBufGx.OrderBy(x => x).ElementAt(_calBufGx.Count / 2);
+            res[1] = _calBufGy.OrderBy(x => x).ElementAt(_calBufGy.Count / 2);
+            res[2] = _calBufGz.OrderBy(x => x).ElementAt(_calBufGz.Count / 2);
+            res[3] = _calBufAx.OrderBy(x => x).ElementAt(_calBufAx.Count / 2);
+            res[4] = _calBufAy.OrderBy(x => x).ElementAt(_calBufAy.Count / 2);
+
+            float medianZ = _calBufAz.OrderBy(x => x).ElementAt(_calBufAz.Count / 2);
+            if (this.isLeft) res[5] = medianZ - 4010;
+            else res[5] = medianZ + 4010;
+
+            return res;
+        }
+
         public byte LED { get; private set; } = 0x0;
         public void SetLEDByPlayerNum(int id) {
             if (id > 3) {
@@ -306,13 +356,13 @@ namespace BetterJoyForCemu {
         public string serial_number;
         bool thirdParty = false;
 
-        private float[] activeData;
+        public float[] active_calibration_data = new float[6] { 0, 0, 0, 0, 0, 0 };
         static float AHRS_beta = float.Parse(ConfigurationManager.AppSettings["AHRS_beta"]);
         private MadgwickAHRS AHRS = new MadgwickAHRS(0.005f, AHRS_beta); // for getting filtered Euler angles of rotation; 5ms sampling rate
 
         public Joycon(IntPtr handle_, bool imu, bool localize, float alpha, bool left, string path, string serialNum, int id = 0, bool isPro = false, bool isSnes = false, bool is64 = false, bool thirdParty = false) {
             serial_number = serialNum;
-            activeData = new float[6];
+            active_calibration_data = new float[6];
             handle = handle_;
             imu_enabled = imu;
             do_localize = localize;
@@ -354,10 +404,21 @@ namespace BetterJoyForCemu {
             } else {
                 isVerticalMode = false; // Default to horizontal to match UI
             }
+
+            // INICIO CAMBIO: Cargar calibración persistente
+            float[] cachedCali = CalibrationManager.GetCalibration(this.serial_number);
+            if (cachedCali != null) {
+                this.active_calibration_data = cachedCali;
+                Console.WriteLine($"Loaded cached calibration for {this.serial_number}");
+            }
+            // FIN CAMBIO
         }
 
         public void getActiveData() {
-            this.activeData = form.activeCaliData(serial_number);
+            float[] cachedCali = CalibrationManager.GetCalibration(this.serial_number);
+            if (cachedCali != null) {
+                this.active_calibration_data = cachedCali;
+            }
         }
 
         public void ReceiveRumble(Xbox360FeedbackReceivedEventArgs e) {
@@ -477,6 +538,10 @@ namespace BetterJoyForCemu {
 
         public void SetPlayerLED(byte leds_ = 0x0) {
             Subcommand(0x30, new byte[] { leds_ }, 1);
+        }
+
+        public void SetPlayerLEDByPadID() {
+            SetLEDByPlayerNum(PadId);
         }
 
         public void BlinkHomeLight() { // do not call after initial setup
@@ -626,54 +691,54 @@ namespace BetterJoyForCemu {
             int ret = HIDapi.hid_read_timeout(handle, raw_buf, new UIntPtr(report_len), 5);
 
             if (ret > 0) {
-                // Process packets as soon as they come
+                // Arrays para guardar las 3 muestras de este paquete
+                float[] batchGyroZ = new float[3];
+                float[] batchGyroY = new float[3];
+
                 for (int n = 0; n < 3; n++) {
                     ExtractIMUValues(raw_buf, n);
+                    this.cur_rotation = AHRS.GetEulerAngles(); // Mantenemos esto para otras funciones
 
+                    // Guardamos los datos CRUDOS (más rápidos que Filtered para apuntar)
+                    // Si prefieres Filtered (menos temblor, más lag), usa cur_rotation aquí.
+                    batchGyroZ[n] = gyr_g.Z; 
+                    batchGyroY[n] = gyr_g.Y;
+
+                    // ... (código original de timestamps y botones - NO TOCAR) ...
                     byte lag = (byte)Math.Max(0, raw_buf[1] - ts_en - 3);
                     if (n == 0) {
-                        Timestamp += (ulong)lag * 5000; // add lag once
+                        Timestamp += (ulong)lag * 5000;
                         ProcessButtonsAndStick(raw_buf);
-
-                        // process buttons here to have them affect DS4
                         DoThingsWithButtons();
-
                         int newbat = battery;
                         battery = (raw_buf[2] >> 4) / 2;
-                        if (newbat != battery)
-                            BatteryChanged();
+                        if (newbat != battery) BatteryChanged();
                     }
-                    Timestamp += 5000; // 5ms difference
-
+                    Timestamp += 5000;
                     packetCounter++;
-                    if (Program.server != null)
-                        Program.server.NewReportIncoming(this);
-
-                    if (out_ds4 != null) {
-                        try {
-                            out_ds4.UpdateInput(MapToDualShock4Input(this));
-                        } catch (Exception) {
-                            // ignore /shrug
-                        }
-                    }
+                    
+                    // Server UDP (Dolphin) necesita actualización por cada muestra (n)
+                    if (Program.server != null) Program.server.NewReportIncoming(this);
                 }
 
-                // no reason to send XInput reports so often
+                // --- AQUÍ ESTÁ EL CAMBIO ---
+                // Procesamos el movimiento UNA VEZ por paquete USB, usando el promedio de las 3 muestras.
+                // dt = 0.005f (5ms), pasamos eso para calcular la física.
+                ProcessGyroAccumulation(batchGyroZ, batchGyroY, 0.005f);
+
+                // Enviamos a Xbox/DS4 UNA VEZ por paquete USB (cada 15ms)
+                // Esto elimina el tartamudeo (judder) provocado por enviar datos demasiado rápido al driver.
                 if (out_xbox != null) {
-                    try {
-                        out_xbox.UpdateInput(MapToXbox360Input(this));
-                    } catch (Exception) {
-                        // ignore /shrug
-                    }
+                    try { out_xbox.UpdateInput(MapToXbox360Input(this)); } catch { }
                 }
-
+                if (out_ds4 != null) {
+                    try { out_ds4.UpdateInput(MapToDualShock4Input(this)); } catch { }
+                }
 
                 if (ts_en == raw_buf[1] && !(isSnes || is64)) {
-                    form.AppendTextBox("Duplicate timestamp enqueued.\r\n");
-                    DebugPrint(string.Format("Duplicate timestamp enqueued. TS: {0:X2}", ts_en), DebugType.THREADING);
+                    // ... logs originales ...
                 }
                 ts_en = raw_buf[1];
-                DebugPrint(string.Format("Enqueue. Bytes read: {0:D}. Timestamp: {1:X2}", ret, raw_buf[1]), DebugType.THREADING);
             }
             return ret;
         }
@@ -750,6 +815,63 @@ namespace BetterJoyForCemu {
             }
         }
 
+        private void ProcessGyroAccumulation(float[] gyroZ_samples, float[] gyroY_samples, float dt) {
+            string extraGyroFeature = ConfigurationManager.AppSettings["GyroToJoyOrMouse"];
+            bool isGyroActive = (Config.Value("active_gyro") == "0" || active_gyro);
+
+            if (extraGyroFeature.Substring(0, 3) != "joy" || !isGyroActive) {
+                // Centrar suavemente si se desactiva (opcional)
+                // virtualStickX = 0; virtualStickY = 0; 
+                return;
+            }
+
+            // 1. Promediar las muestras del paquete (Elimina vibración y saltos)
+            float avgGyroZ = 0f;
+            float avgGyroY = 0f;
+            int samples = gyroZ_samples.Length; // Deberían ser 3
+
+            for(int i = 0; i < samples; i++) {
+                avgGyroZ += gyroZ_samples[i];
+                avgGyroY += gyroY_samples[i];
+            }
+            avgGyroZ /= samples;
+            avgGyroY /= samples;
+
+            // 2. Zona Muerta de Entrada (Evita el Drifting minúsculo)
+            // Si el movimiento es menor a 0.5 grados/segundo, ignóralo.
+            if (Math.Abs(avgGyroZ) < 0.5f) avgGyroZ = 0f;
+            if (Math.Abs(avgGyroY) < 0.5f) avgGyroY = 0f;
+
+            // 3. Obtener Sensibilidad del Config
+            float sensX = Mappings.GetFloat("Gyro_Sensitivity_X") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityX"]);
+            float sensY = Mappings.GetFloat("Gyro_Sensitivity_Y") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityY"]);
+
+            // 4. FACTOR DE REDUCCIÓN DE SENSIBILIDAD (CRUCIAL)
+            // Como estamos mapeando Grados -> Joystick(0..1), necesitamos reducir drásticamente los valores.
+            // Multiplicamos por 0.0001f para que los valores de config (ej. 40.0) sean usables.
+            float reductionFactor = 0.0001f; 
+
+            // 5. Acumular Posición (Integración)
+            // Yaw (Eje X) suele ser Z en el sensor. Pitch (Eje Y) suele ser Y.
+            // Invertimos signos según sea necesario.
+            virtualStickX += avgGyroZ * sensX * reductionFactor * (dt * samples * 1000); // Escalado por tiempo
+            virtualStickY += -(avgGyroY * sensY * reductionFactor * (dt * samples * 1000));
+
+            // 6. Clamp (Límites del Joystick)
+            virtualStickX = Math.Max(-1.0f, Math.Min(1.0f, virtualStickX));
+            virtualStickY = Math.Max(-1.0f, Math.Min(1.0f, virtualStickY));
+
+            // 7. Interpolación de Salida (Smoothness)
+            // Esto hace que el movimiento sea "cremoso" en lugar de escalonado
+            smoothStickX += (virtualStickX - smoothStickX) * interpolationFactor;
+            smoothStickY += (virtualStickY - smoothStickY) * interpolationFactor;
+
+            // 8. Aplicar al Joystick Físico
+            float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
+            control_stick[0] = smoothStickX;
+            control_stick[1] = smoothStickY;
+        }
+
         // For Joystick->Joystick inputs
         private void SimulateContinous(int origin, string s) {
             if (s.StartsWith("joy_")) {
@@ -779,6 +901,70 @@ namespace BetterJoyForCemu {
 
 
         byte[] sliderVal = new byte[] { 0, 0 };
+
+        private void ApplyGyroToJoystick(float dt) {
+            // Verificar activación
+            string extraGyroFeature = ConfigurationManager.AppSettings["GyroToJoyOrMouse"];
+            bool isGyroActive = (Config.Value("active_gyro") == "0" || active_gyro);
+            
+            if (extraGyroFeature.Substring(0, 3) != "joy" || !isGyroActive) {
+                // Reset suave cuando no se usa para que no salte al reactivar
+                velX_smoothed = 0f;
+                velY_smoothed = 0f;
+                return;
+            }
+
+            // --- LEER SENSORES ---
+            // Usamos datos CRUDOS (gyr_g) porque nosotros haremos la fusión manualmente
+            // Invertimos signos según sea necesario para tu orientación
+            float gyroSpeedX = gyr_g.Z; // Yaw (Giro horizontal)
+            float gyroSpeedY = gyr_g.Y; // Pitch (Giro vertical)
+            
+            // Sensibilidad base
+            float sensX = Mappings.GetFloat("Gyro_Sensitivity_X") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityX"]);
+            float sensY = Mappings.GetFloat("Gyro_Sensitivity_Y") * float.Parse(ConfigurationManager.AppSettings["GyroStickSensitivityY"]);
+
+            // --- FASE 1: CALCULAR ÁNGULO CON ACELERÓMETRO (Corrección de Gravedad) ---
+            // El acelerómetro sabe dónde está el suelo. Calculamos el ángulo Pitch absoluto.
+            // Atan2 devuelve radianes, convertimos a grados si es necesario, pero aquí trabajamos directo.
+            // Nota: Ajusta los ejes acc_g.Y / acc_g.Z según cómo sostengas el mando (plano vs vertical)
+            float accelPitch = (float)(Math.Atan2(acc_g.Y, acc_g.Z) * 180 / Math.PI); 
+
+            // --- FASE 2: FILTRO COMPLEMENTARIO (La Magia de Wii) ---
+            // Fórmula: Ángulo = 0.98 * (Ángulo + Gyro*dt) + 0.02 * (Acelerómetro)
+            // Esto usa el gyro para movimiento rápido y el acelerómetro para corregir drift lento.
+            
+            // EJE Y (Vertical) - Fusionado con gravedad
+            float gyroDeltaY = -(gyroSpeedY * dt * sensY); // Proyección de velocidad
+            angleY_fused = compFilter * (angleY_fused + gyroDeltaY) + (1f - compFilter) * (accelPitch * sensY * 0.05f); 
+            // Nota: El factor 0.05f en accelPitch es un "número mágico" para escalar los grados del acelerómetro al rango -1.0/1.0 del stick. 
+            // Ajusta si al inclinar el mando la mira se mueve demasiado o muy poco.
+
+            // EJE X (Horizontal) - Solo Gyro (No hay gravedad horizontal para corregir Yaw)
+            // Aquí seguimos usando acumulación simple pero suavizada, ya que el magnetómetro es complejo.
+            float gyroDeltaX = (gyroSpeedX * dt * sensX);
+            angleX_fused += gyroDeltaX;
+
+            // --- FASE 3: SUAVIZADO DE SALIDA (Para quitar "Saltos") ---
+            // Aplicamos un pequeño LERP a la salida final para "cremear" el movimiento a 60fps
+            virtualStickX = (virtualStickX * (1f - alpha)) + (angleX_fused * alpha);
+            virtualStickY = (virtualStickY * (1f - alpha)) + (angleY_fused * alpha);
+
+            // --- FASE 4: MAPPED Y CLAMP ---
+            // Mapeamos al joystick (-1 a 1)
+            float finalX = Math.Max(-1.0f, Math.Min(1.0f, virtualStickX));
+            float finalY = Math.Max(-1.0f, Math.Min(1.0f, virtualStickY));
+
+            // Corrección anti-drift simple para X (si lo sueltas en la mesa)
+            if (Math.Abs(gyroSpeedX) < 2.0f) { // Si el gyro apenas se mueve
+                // Opcional: Decaer lentamente la velocidad X o mantenerla fija
+            }
+
+            // Aplicar
+            float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
+            control_stick[0] = finalX;
+            control_stick[1] = finalY;
+        }
 
         private void DoThingsWithButtons() {
             int powerOffButton = (int)((isPro || !isLeft || other != null) ? Button.HOME : Button.CAPTURE);
@@ -885,6 +1071,11 @@ namespace BetterJoyForCemu {
             string res_val = Config.Value("active_gyro");
             if (res_val.StartsWith("joy_")) {
                 int i = Int32.Parse(res_val.Substring(4));
+                if (buttons_down[i]) {
+                    virtualStickX = 0f;
+                    virtualStickY = 0f;
+                }
+
                 if (GyroHoldToggle) {
                     if (buttons_down[i] || (other != null && !SingleJoyConGyroVertical && other.buttons_down[i]))
                         active_gyro = true;
@@ -896,36 +1087,7 @@ namespace BetterJoyForCemu {
                 }
             }
 
-            if (extraGyroFeature.Substring(0, 3) == "joy") {
-                // Definimos cuál stick vamos a controlar (izquierdo o derecho)
-                float[] control_stick = (extraGyroFeature == "joy_left") ? stick : stick2;
-
-                if (Config.Value("active_gyro") == "0" || active_gyro) {
-                    
-                    float dx, dy;
-
-                    if (UseFilteredIMU) {
-                        dx = (GyroStickSensitivityX * (cur_rotation[1] - cur_rotation[4])); // yaw
-                        dy = -(GyroStickSensitivityY * (cur_rotation[0] - cur_rotation[3])); // pitch
-                    } else {
-                        dx = (GyroStickSensitivityX * (gyr_g.Z * dt)); // yaw
-                        dy = -(GyroStickSensitivityY * (gyr_g.Y * dt)); // pitch
-                    }
-
-                    // Apply Custom Config Sensitivity/Direction Multipliers
-                    dx *= Mappings.GetFloat("Gyro_Sensitivity_X");
-                    dy *= Mappings.GetFloat("Gyro_Sensitivity_Y");
-
-                    control_stick[0] = Math.Max(-1.0f, Math.Min(1.0f, control_stick[0] / GyroStickReduction + dx));
-                    control_stick[1] = Math.Max(-1.0f, Math.Min(1.0f, control_stick[1] / GyroStickReduction + dy));
-                } else {
-                    // MODIFICACIÓN:
-                    // Si el giroscopio NO está activo (y no está configurado como siempre activo "0"),
-                    // forzamos el stick a 0,0 (centro).
-                    control_stick[0] = 0.0f;
-                    control_stick[1] = 0.0f;
-                }
-            } else if (extraGyroFeature == "mouse" && (isPro || (other == null) || (other != null && (Boolean.Parse(ConfigurationManager.AppSettings["GyroMouseLeftHanded"]) ? isLeft : !isLeft)))) {
+            if (extraGyroFeature == "mouse" && (isPro || (other == null) || (other != null && (Boolean.Parse(ConfigurationManager.AppSettings["GyroMouseLeftHanded"]) ? isLeft : !isLeft)))) {
                 // gyro data is in degrees/s
                 if (Config.Value("active_gyro") == "0" || active_gyro) {
                     int dx, dy;
@@ -1104,32 +1266,29 @@ namespace BetterJoyForCemu {
                 acc_r[1] = (Int16)(report_buf[15 + n * 12] | ((report_buf[16 + n * 12] << 8) & 0xff00));
                 acc_r[2] = (Int16)(report_buf[17 + n * 12] | ((report_buf[18 + n * 12] << 8) & 0xff00));
 
+                if (this.IsCalibrating) {
+                    _calBufGx.Add(gyr_r[0]);
+                    _calBufGy.Add(gyr_r[1]);
+                    _calBufGz.Add(gyr_r[2]);
+                    _calBufAx.Add(acc_r[0]);
+                    _calBufAy.Add(acc_r[1]);
+                    _calBufAz.Add(acc_r[2]);
+                }
+
                 if (form.allowCalibration) {
                     for (int i = 0; i < 3; ++i) {
                         switch (i) {
                             case 0:
-                                acc_g.X = (acc_r[i] - activeData[3]) * (1.0f / acc_sen[i]) * 4.0f;
-                                gyr_g.X = (gyr_r[i] - activeData[0]) * (816.0f / gyr_sen[i]);
-                                if (form.calibrate) {
-                                    form.xA.Add(acc_r[i]);
-                                    form.xG.Add(gyr_r[i]);
-                                }
+                                acc_g.X = (acc_r[i] - active_calibration_data[3]) * (1.0f / acc_sen[i]) * 4.0f;
+                                gyr_g.X = (gyr_r[i] - active_calibration_data[0]) * (816.0f / gyr_sen[i]);
                                 break;
                             case 1:
-                                acc_g.Y = (!isLeft ? -1 : 1) * (acc_r[i] - activeData[4]) * (1.0f / acc_sen[i]) * 4.0f;
-                                gyr_g.Y = -(!isLeft ? -1 : 1) * (gyr_r[i] - activeData[1]) * (816.0f / gyr_sen[i]);
-                                if (form.calibrate) {
-                                    form.yA.Add(acc_r[i]);
-                                    form.yG.Add(gyr_r[i]);
-                                }
+                                acc_g.Y = (!isLeft ? -1 : 1) * (acc_r[i] - active_calibration_data[4]) * (1.0f / acc_sen[i]) * 4.0f;
+                                gyr_g.Y = -(!isLeft ? -1 : 1) * (gyr_r[i] - active_calibration_data[1]) * (816.0f / gyr_sen[i]);
                                 break;
                             case 2:
-                                acc_g.Z = (!isLeft ? -1 : 1) * (acc_r[i] - activeData[5]) * (1.0f / acc_sen[i]) * 4.0f;
-                                gyr_g.Z = -(!isLeft ? -1 : 1) * (gyr_r[i] - activeData[2]) * (816.0f / gyr_sen[i]);
-                                if (form.calibrate) {
-                                    form.zA.Add(acc_r[i]);
-                                    form.zG.Add(gyr_r[i]);
-                                }
+                                acc_g.Z = (!isLeft ? -1 : 1) * (acc_r[i] - active_calibration_data[5]) * (1.0f / acc_sen[i]) * 4.0f;
+                                gyr_g.Z = -(!isLeft ? -1 : 1) * (gyr_r[i] - active_calibration_data[2]) * (816.0f / gyr_sen[i]);
                                 break;
                         }
                     }
@@ -1551,7 +1710,7 @@ namespace BetterJoyForCemu {
             return false;
         }
 
-        private static OutputControllerXbox360InputState MapToXbox360Input(Joycon input) {
+        public static OutputControllerXbox360InputState MapToXbox360Input(Joycon input) {
             var output = new OutputControllerXbox360InputState();
 
             var swapAB = input.swapAB;

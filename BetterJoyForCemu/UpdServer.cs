@@ -318,56 +318,65 @@ namespace BetterJoyForCemu {
         }
 
         private bool ReportToBuffer(Joycon hidReport, byte[] outputData, ref int outIdx) {
-            var ds4 = Joycon.MapToDualShock4Input(hidReport);
+            // EDITADO: Usamos el mapeo de Xbox 360 para obtener la configuración correcta (swap A/B, etc.)
+            var x360 = Joycon.MapToXbox360Input(hidReport);
 
             outputData[outIdx] = 0;
 
-            if (ds4.dPad == Controller.DpadDirection.West || ds4.dPad == Controller.DpadDirection.Northwest || ds4.dPad == Controller.DpadDirection.Southwest) outputData[outIdx] |= 0x80;
-            if (ds4.dPad == Controller.DpadDirection.South || ds4.dPad == Controller.DpadDirection.Southwest || ds4.dPad == Controller.DpadDirection.Southeast) outputData[outIdx] |= 0x40;
-            if (ds4.dPad == Controller.DpadDirection.East || ds4.dPad == Controller.DpadDirection.Northeast || ds4.dPad == Controller.DpadDirection.Southeast) outputData[outIdx] |= 0x20;
-            if (ds4.dPad == Controller.DpadDirection.North || ds4.dPad == Controller.DpadDirection.Northwest || ds4.dPad == Controller.DpadDirection.Northeast) outputData[outIdx] |= 0x10;
+            // D-Pad (Byte 0: Bits 4-7)
+            if (x360.dpad_left) outputData[outIdx] |= 0x80;
+            if (x360.dpad_down) outputData[outIdx] |= 0x40;
+            if (x360.dpad_right) outputData[outIdx] |= 0x20;
+            if (x360.dpad_up) outputData[outIdx] |= 0x10;
 
-            if (ds4.options) outputData[outIdx] |= 0x08;
-            if (ds4.thumb_right) outputData[outIdx] |= 0x04;
-            if (ds4.thumb_left) outputData[outIdx] |= 0x02;
-            if (ds4.share) outputData[outIdx] |= 0x01;
+            // System Buttons (Byte 0: Bits 0-3)
+            if (x360.start) outputData[outIdx] |= 0x08;  // Options
+            if (x360.thumb_stick_right) outputData[outIdx] |= 0x04; // R3
+            if (x360.thumb_stick_left) outputData[outIdx] |= 0x02; // L3
+            if (x360.back) outputData[outIdx] |= 0x01; // Share
 
             outputData[++outIdx] = 0;
 
-            if (ds4.square) outputData[outIdx] |= 0x80;
-            if (ds4.cross) outputData[outIdx] |= 0x40;
-            if (ds4.circle) outputData[outIdx] |= 0x20;
-            if (ds4.triangle) outputData[outIdx] |= 0x10;
+            // Face Buttons & Shoulders (Byte 1)
+            // Mapeamos la lógica geométrica de Xbox a PS (A=Cruz, B=Círculo, X=Cuadrado, Y=Triángulo)
+            if (x360.x) outputData[outIdx] |= 0x80; // Cuadrado (Oeste)
+            if (x360.a) outputData[outIdx] |= 0x40; // Cruz (Sur)
+            if (x360.b) outputData[outIdx] |= 0x20; // Círculo (Este)
+            if (x360.y) outputData[outIdx] |= 0x10; // Triángulo (Norte)
 
-            if (ds4.shoulder_right) outputData[outIdx] |= 0x08;
-            if (ds4.shoulder_left) outputData[outIdx] |= 0x04;
-            if (ds4.trigger_right_value == Byte.MaxValue) outputData[outIdx] |= 0x02;
-            if (ds4.trigger_left_value == Byte.MaxValue) outputData[outIdx] |= 0x01;
+            if (x360.shoulder_right) outputData[outIdx] |= 0x08; // R1
+            if (x360.shoulder_left) outputData[outIdx] |= 0x04; // L1
+            if (x360.trigger_right > 0) outputData[outIdx] |= 0x02; // R2 Digital
+            if (x360.trigger_left > 0) outputData[outIdx] |= 0x01; // L2 Digital
 
-            outputData[++outIdx] = ds4.ps ? (byte)1 : (byte)0;
-            outputData[++outIdx] = ds4.touchpad ? (byte)1 : (byte)0;
+            // PS Button y Touchpad click
+            outputData[++outIdx] = x360.guide ? (byte)1 : (byte)0;
+            outputData[++outIdx] = 0; // Touchpad no tiene equivalente directo en x360 struct
 
-            outputData[++outIdx] = ds4.thumb_left_x;
-            outputData[++outIdx] = ds4.thumb_left_y;
-            outputData[++outIdx] = ds4.thumb_right_x;
-            outputData[++outIdx] = ds4.thumb_right_y;
+            // Sticks Analógicos (Convertir short Xbox a byte PS)
+            // Xbox: -32768 a 32767. PS: 0 a 255 (128 centro).
+            // Eje Y Xbox es positivo arriba. Eje Y PS/DSU es positivo abajo. Invertimos Y.
+            outputData[++outIdx] = (byte)((x360.axis_left_x / 256) + 128);
+            outputData[++outIdx] = (byte)((-x360.axis_left_y / 256) + 128);
+            outputData[++outIdx] = (byte)((x360.axis_right_x / 256) + 128);
+            outputData[++outIdx] = (byte)((-x360.axis_right_y / 256) + 128);
 
-            //we don't have analog buttons so just use the Button enums (which give either 0 or 0xFF)
-            outputData[++outIdx] = (ds4.dPad == Controller.DpadDirection.West || ds4.dPad == Controller.DpadDirection.Northwest || ds4.dPad == Controller.DpadDirection.Southwest) ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = (ds4.dPad == Controller.DpadDirection.South || ds4.dPad == Controller.DpadDirection.Southwest || ds4.dPad == Controller.DpadDirection.Southeast) ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = (ds4.dPad == Controller.DpadDirection.East || ds4.dPad == Controller.DpadDirection.Northeast || ds4.dPad == Controller.DpadDirection.Southeast) ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = (ds4.dPad == Controller.DpadDirection.North || ds4.dPad == Controller.DpadDirection.Northwest || ds4.dPad == Controller.DpadDirection.Northeast) ? (byte)0xFF : (byte)0; ;
+            // Botones "analógicos" (DSU espera 0x00 o 0xFF)
+            outputData[++outIdx] = x360.dpad_left ? (byte)0xFF : (byte)0; // D-Left
+            outputData[++outIdx] = x360.dpad_down ? (byte)0xFF : (byte)0; // D-Down
+            outputData[++outIdx] = x360.dpad_right ? (byte)0xFF : (byte)0; // D-Right
+            outputData[++outIdx] = x360.dpad_up ? (byte)0xFF : (byte)0; // D-Up
 
-            outputData[++outIdx] = ds4.square ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = ds4.cross ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = ds4.circle ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = ds4.triangle ? (byte)0xFF : (byte)0;
+            outputData[++outIdx] = x360.x ? (byte)0xFF : (byte)0; // Cuadrado
+            outputData[++outIdx] = x360.a ? (byte)0xFF : (byte)0; // Cruz
+            outputData[++outIdx] = x360.b ? (byte)0xFF : (byte)0; // Círculo
+            outputData[++outIdx] = x360.y ? (byte)0xFF : (byte)0; // Triángulo
 
-            outputData[++outIdx] = ds4.shoulder_right ? (byte)0xFF : (byte)0;
-            outputData[++outIdx] = ds4.shoulder_left ? (byte)0xFF : (byte)0;
+            outputData[++outIdx] = x360.shoulder_right ? (byte)0xFF : (byte)0; // R1
+            outputData[++outIdx] = x360.shoulder_left ? (byte)0xFF : (byte)0; // L1
 
-            outputData[++outIdx] = ds4.trigger_right_value;
-            outputData[++outIdx] = ds4.trigger_left_value;
+            outputData[++outIdx] = x360.trigger_right; // R2 Analógico
+            outputData[++outIdx] = x360.trigger_left;  // L2 Analógico
 
             outIdx++;
 
@@ -430,10 +439,10 @@ namespace BetterJoyForCemu {
                     if ((now - cl.Value.AllPadsTime).TotalSeconds < TimeoutLimit)
                         clientsList.Add(cl.Key);
                     else if ((hidReport.PadId >= 0 && hidReport.PadId <= 3) &&
-                             (now - cl.Value.PadIdsTime[(byte)hidReport.PadId]).TotalSeconds < TimeoutLimit)
+                            (now - cl.Value.PadIdsTime[(byte)hidReport.PadId]).TotalSeconds < TimeoutLimit)
                         clientsList.Add(cl.Key);
                     else if (cl.Value.PadMacsTime.ContainsKey(hidReport.PadMacAddress) &&
-                             (now - cl.Value.PadMacsTime[hidReport.PadMacAddress]).TotalSeconds < TimeoutLimit)
+                            (now - cl.Value.PadMacsTime[hidReport.PadMacAddress]).TotalSeconds < TimeoutLimit)
                         clientsList.Add(cl.Key);
                     else //check if this client is totally dead, and remove it if so
                     {
